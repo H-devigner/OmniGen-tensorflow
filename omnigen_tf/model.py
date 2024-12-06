@@ -91,12 +91,12 @@ class PatchEmbedMR(layers.Layer):
     def call(self, x):
         if not self.built:
             self.build(x.shape)
-        # PyTorch uses channels first, TensorFlow uses channels last
-        # Convert from [B, H, W, C] to [B, C, H, W] for conv
-        x = tf.transpose(x, [0, 3, 1, 2])
+        # Input is [B, H, W, C], which is already in TensorFlow's channels_last format
+        # No need to transpose
         x = self.proj(x)
-        # Convert back to [B, H, W, C]
-        x = tf.transpose(x, [0, 2, 3, 1])
+        # Reshape to [B, H*W, C]
+        B, H, W, C = x.shape
+        x = tf.reshape(x, [B, H * W, C])
         return x
 
 class Transformer(layers.Layer):
