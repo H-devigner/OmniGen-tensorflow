@@ -3,7 +3,7 @@ import os
 import tensorflow as tf
 from PIL import Image
 import numpy as np
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict, Any, Callable
 import time
 from huggingface_hub import snapshot_download
 from safetensors import safe_open

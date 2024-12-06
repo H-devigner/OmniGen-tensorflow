@@ -1,6 +1,9 @@
+"""Weight converter for PyTorch to TensorFlow."""
 import os
 import tensorflow as tf
 import numpy as np
+import torch
+from typing import Dict, Any, Optional
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file, save_file
 
