@@ -171,19 +171,36 @@ class OmniGenTF(tf.keras.Model):
         x = tf.reshape(x, [B, h, w, c])
         return x
         
-    def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
-        """Process latents at multiple resolutions."""
-        embedder = self.input_x_embedder if is_input_images else self.x_embedder
-        
-        # Get dimensions
-        B, H, W, C = tf.shape(latents)[0], tf.shape(latents)[1], tf.shape(latents)[2], tf.shape(latents)[3]
-        
-        # Embed latents
-        x = embedder(latents)
-        
-        # Get position embeddings for this resolution
-        pos_embed = self.pos_embed[:, :H*W//4]  # Divide by 4 due to patch size of 2
-        
+    def patch_multiple_resolutions(self, x, padding_latent):
+        """Process input through patch embedding with proper device placement."""
+        with tf.device('/CPU:0'):  # Ensure initial tensors are on CPU
+            B = tf.shape(x)[0]
+            
+            # Initialize position embeddings on CPU first
+            pos_embed = tf.zeros_like(x)
+            
+            # Process each resolution level
+            for i, (H, W) in enumerate([(self.pos_embed_max_size, self.pos_embed_max_size)]):
+                if i < len([(self.pos_embed_max_size, self.pos_embed_max_size)]) - 1:
+                    mask = tf.cast(padding_latent <= i, x.dtype)
+                    mask = tf.expand_dims(tf.expand_dims(mask, -1), -1)
+                else:
+                    mask = tf.ones_like(x[:, :1, :1])
+                    
+                # Calculate position embeddings for this resolution
+                pos = self.pos_embed[:, :H*W//4]  # Divide by 4 due to patch size of 2
+                pos = tf.repeat(tf.expand_dims(pos, 0), B, axis=0)
+                pos = tf.cast(pos, x.dtype)
+                
+                # Add to total position embeddings
+                pos_embed = pos_embed + mask * pos
+                
+        # Move processed tensors to GPU if available
+        if len(tf.config.list_physical_devices('GPU')) > 0:
+            with tf.device('/GPU:0'):
+                x = tf.identity(x)
+                pos_embed = tf.identity(pos_embed)
+                
         return x, pos_embed
 
     def call(
@@ -200,52 +217,67 @@ class OmniGenTF(tf.keras.Model):
         return_past_key_values=True,
         offload_model=False
     ):
-        """Forward pass matching PyTorch implementation."""
-        # Process input through patch embedding
-        x, pos_embed = self.patch_multiple_resolutions(x, padding_latent)
-        x = x + tf.cast(pos_embed, x.dtype)
+        """Forward pass with proper device handling."""
+        # Ensure inputs are properly placed on device
+        x = tf.convert_to_tensor(x)
+        timestep = tf.convert_to_tensor(timestep)
         
-        # Get timestep embedding
-        t_emb = self.t_embedder(timestep)
-        
-        # Process input images if provided
-        if input_img_latents is not None:
-            input_x, _ = self.patch_multiple_resolutions(
-                input_img_latents,
-                padding_latent,
-                is_input_images=True
-            )
-            x = tf.concat([x, input_x], axis=1)
-        
-        # Add time token
-        time_token = self.time_token(timestep)
-        time_token = tf.expand_dims(time_token, axis=1)
-        x = tf.concat([time_token, x], axis=1)
-        
-        # Process through transformer
-        hidden_states = self.llm(
-            input_ids=input_ids,
-            inputs_embeds=x,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=return_past_key_values,
-            training=False
-        )
-        
-        if return_past_key_values:
-            x = hidden_states[0]
-            past_key_values = hidden_states[1]
-        else:
-            x = hidden_states[0]
-            past_key_values = None
+        if input_ids is not None:
+            input_ids = tf.convert_to_tensor(input_ids)
+        if attention_mask is not None:
+            attention_mask = tf.convert_to_tensor(attention_mask)
+        if position_ids is not None:
+            position_ids = tf.convert_to_tensor(position_ids)
             
-        # Final layer processing
-        x = self.final_layer(x[:, 1:], t_emb)  # Remove time token
+        # Get device context
+        device_ctx = '/GPU:0' if len(tf.config.list_physical_devices('GPU')) > 0 else '/CPU:0'
         
-        if return_past_key_values:
-            return x, past_key_values
-        return x
+        with tf.device(device_ctx):
+            # Process input through patch embedding
+            x, pos_embed = self.patch_multiple_resolutions(x, padding_latent)
+            x = x + pos_embed
+            
+            # Get timestep embedding
+            t_emb = self.t_embedder(timestep)
+            
+            # Process input images if provided
+            if input_img_latents is not None:
+                input_x, _ = self.patch_multiple_resolutions(
+                    input_img_latents,
+                    padding_latent,
+                    is_input_images=True
+                )
+                x = tf.concat([x, input_x], axis=1)
+            
+            # Add time token
+            time_token = self.time_token(timestep)
+            time_token = tf.expand_dims(time_token, axis=1)
+            x = tf.concat([time_token, x], axis=1)
+            
+            # Process through transformer
+            hidden_states = self.llm(
+                input_ids=input_ids,
+                inputs_embeds=x,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=return_past_key_values,
+                training=False
+            )
+            
+            if return_past_key_values:
+                x = hidden_states[0]
+                past_key_values = hidden_states[1]
+            else:
+                x = hidden_states[0]
+                past_key_values = None
+                
+            # Final layer processing
+            x = self.final_layer(x[:, 1:], t_emb)  # Remove time token
+            
+            if return_past_key_values:
+                return x, past_key_values
+            return x
         
     def forward_with_cfg(
         self,
