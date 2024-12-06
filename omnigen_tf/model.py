@@ -10,6 +10,7 @@ from huggingface_hub import snapshot_download
 from .converter import WeightConverter
 from .peft import PeftAdapterMixin
 import os
+import json
 
 def modulate(x, shift, scale):
     """Modulate layer output."""

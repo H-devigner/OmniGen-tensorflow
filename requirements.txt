@@ -8,3 +8,4 @@ tqdm>=4.65.0
 huggingface-hub>=0.16.4
 safetensors>=0.3.1
 accelerate>=0.21.0
+json
