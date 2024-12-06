@@ -11,6 +11,7 @@ from .converter import WeightConverter
 from .peft import PeftAdapterMixin
 import os
 import json
+import torch
 
 def modulate(x, shift, scale):
     """Modulate layer norm output."""
@@ -355,6 +356,95 @@ class OmniGenTF(tf.keras.Model):
         if use_kv_cache and past_key_values is not None:
             return noise_pred, past_key_values
         return noise_pred
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_path, use_mixed_precision=False, **kwargs):
+        """Load pretrained model from path.
+        
+        Args:
+            pretrained_model_path: Path to pretrained model directory
+            use_mixed_precision: Whether to use mixed precision
+            **kwargs: Additional arguments to pass to model initialization
+            
+        Returns:
+            OmniGenTF: Loaded model
+        """
+        # Load config
+        config_path = os.path.join(pretrained_model_path, "config.json")
+        if not os.path.exists(config_path):
+            raise ValueError(f"Config not found at {config_path}")
+            
+        with open(config_path, "r") as f:
+            config = json.load(f)
+            
+        # Initialize model
+        model = cls(config, **kwargs)
+        
+        # Set mixed precision if requested
+        if use_mixed_precision:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            
+        # Load weights
+        weights_path = os.path.join(pretrained_model_path, "tf_model.h5")
+        if os.path.exists(weights_path):
+            model.load_weights(weights_path)
+        else:
+            # Try loading PyTorch weights and converting
+            pytorch_weights = os.path.join(pretrained_model_path, "pytorch_model.bin")
+            if not os.path.exists(pytorch_weights):
+                raise ValueError(f"No weights found at {weights_path} or {pytorch_weights}")
+                
+            # Load and convert PyTorch weights
+            state_dict = torch.load(pytorch_weights, map_location="cpu")
+            model.load_state_dict_from_pytorch(state_dict)
+            
+            # Save converted weights
+            model.save_weights(weights_path)
+            
+        return model
+        
+    def load_state_dict_from_pytorch(self, state_dict):
+        """Load PyTorch state dict.
+        
+        Args:
+            state_dict: PyTorch state dict
+        """
+        # Map PyTorch parameter names to TF names
+        name_mapping = {
+            "llm.": "transformer.",
+            "input_x_embedder": "input_embedder",
+            "x_embedder": "latent_embedder",
+            "final_layer": "output_projection",
+            ".weight": "/kernel",
+            ".bias": "/bias",
+            "layernorm": "layer_norm"
+        }
+        
+        # Convert and load weights
+        tf_weights = {}
+        for pt_name, pt_param in state_dict.items():
+            tf_name = pt_name
+            for pt_pattern, tf_pattern in name_mapping.items():
+                tf_name = tf_name.replace(pt_pattern, tf_pattern)
+                
+            # Convert parameter
+            param_value = pt_param.numpy()
+            
+            # Handle kernel transformations
+            if "kernel" in tf_name:
+                if len(param_value.shape) == 4:  # Conv kernels
+                    param_value = np.transpose(param_value, (2, 3, 1, 0))
+                elif len(param_value.shape) == 2:  # Linear kernels
+                    param_value = np.transpose(param_value)
+                    
+            tf_weights[tf_name] = param_value
+            
+        # Set weights
+        self.set_weights([
+            tf_weights[var.name.split(':')[0]]
+            for var in self.trainable_variables
+        ])
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
     """Generate 2D sinusoidal positional embeddings."""
