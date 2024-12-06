@@ -358,7 +358,7 @@ class OmniGenTF(tf.keras.Model):
         return noise_pred
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_path, use_mixed_precision=False, **kwargs):
+    def from_pretrained(cls, pretrained_model_path: str, use_mixed_precision: bool = False, **kwargs):
         """Load pretrained model from path.
         
         Args:
@@ -370,6 +370,9 @@ class OmniGenTF(tf.keras.Model):
             OmniGenTF: Loaded model
         """
         # Load config
+        if not os.path.exists(pretrained_model_path):
+            pretrained_model_path = snapshot_download(pretrained_model_path)
+            
         config_path = os.path.join(pretrained_model_path, "config.json")
         if not os.path.exists(config_path):
             raise ValueError(f"Config not found at {config_path}")
@@ -382,26 +385,37 @@ class OmniGenTF(tf.keras.Model):
         
         # Set mixed precision if requested
         if use_mixed_precision:
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            tf.keras.mixed_precision.set_global_policy(policy)
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
             
         # Load weights
-        weights_path = os.path.join(pretrained_model_path, "tf_model.h5")
+        weights_path = os.path.join(pretrained_model_path, "tf_model")
         if os.path.exists(weights_path):
             model.load_weights(weights_path)
         else:
             # Try loading PyTorch weights and converting
             pytorch_weights = os.path.join(pretrained_model_path, "pytorch_model.bin")
-            if not os.path.exists(pytorch_weights):
-                raise ValueError(f"No weights found at {weights_path} or {pytorch_weights}")
+            safetensors_weights = os.path.join(pretrained_model_path, "model.safetensors")
+            
+            if os.path.exists(safetensors_weights):
+                # Load from safetensors
+                with safe_open(safetensors_weights, framework="pt") as f:
+                    state_dict = {key: f.get_tensor(key) for key in f.keys()}
+            elif os.path.exists(pytorch_weights):
+                # Load from PyTorch weights
+                state_dict = torch.load(pytorch_weights, map_location="cpu")
+            else:
+                raise ValueError(f"No weights found at {weights_path}, {pytorch_weights}, or {safetensors_weights}")
                 
-            # Load and convert PyTorch weights
-            state_dict = torch.load(pytorch_weights, map_location="cpu")
-            model.load_state_dict_from_pytorch(state_dict)
+            # Convert PyTorch weights to TensorFlow
+            converter = WeightConverter()
+            tf_weights = converter.convert_torch_to_tf(state_dict)
             
-            # Save converted weights
+            # Set weights
+            model.set_weights(tf_weights)
+            
+            # Save converted weights for future use
             model.save_weights(weights_path)
-            
+        
         return model
         
     def load_state_dict_from_pytorch(self, state_dict):

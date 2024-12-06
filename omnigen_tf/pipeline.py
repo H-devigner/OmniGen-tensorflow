@@ -87,37 +87,40 @@ class OmniGenPipeline:
         """
         for attempt in range(max_retries):
             try:
+                # Initialize processor first
+                processor = OmniGenProcessor.from_pretrained(model_name)
+                
                 # Download and load model with optimized settings
-                model_path = snapshot_download(model_name)
                 model = OmniGenTF.from_pretrained(
-                    model_path,
+                    model_name,
                     use_mixed_precision=mixed_precision,
                     **kwargs
                 )
                 
                 # Load VAE with optimization
                 if vae_path is None:
-                    vae_path = os.path.join(model_path, "vae")
-                vae = AutoencoderKL.from_pretrained(
-                    vae_path,
-                    use_mixed_precision=mixed_precision
-                )
+                    vae_path = os.path.join(model_name, "vae")
+                vae = AutoencoderKL.from_pretrained(vae_path)
                 
-                # Load processor
-                processor = OmniGenProcessor.from_pretrained(model_path)
-                
-                return cls(
+                # Initialize pipeline
+                pipeline = cls(
                     model=model,
                     vae=vae,
-                    processor=processor,
-                    **kwargs
+                    processor=processor
                 )
                 
+                # Set device and optimization flags
+                pipeline.use_kv_cache = True
+                
+                return pipeline
+                
             except Exception as e:
-                if attempt == max_retries - 1:
+                if attempt < max_retries - 1:
+                    print(f"Attempt {attempt + 1} failed: {str(e)}")
+                    print(f"Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
                     raise e
-                print(f"Attempt {attempt + 1} failed, retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
                 
     def __call__(
         self,
