@@ -13,7 +13,7 @@ import os
 import json
 
 def modulate(x, shift, scale):
-    """Modulate layer output."""
+    """Modulate layer norm output."""
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
 class TimestepEmbedder(layers.Layer):
@@ -26,19 +26,19 @@ class TimestepEmbedder(layers.Layer):
             layers.Activation('swish'),  # SiLU/Swish activation
             layers.Dense(hidden_size, use_bias=True)
         ])
-        
+
     def timestep_embedding(self, t, dim, max_period=10000):
         """Create sinusoidal timestep embeddings."""
         half = dim // 2
         freqs = tf.exp(
-            -math.log(max_period) * tf.range(half, dtype=tf.float32) / half
+            -math.log(max_period) * tf.range(0, half, dtype=tf.float32) / half
         )
-        args = tf.cast(t, tf.float32)[:, None] * freqs[None]
+        args = tf.cast(t[:, None], tf.float32) * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
         if dim % 2:
-            embedding = tf.pad(embedding, [[0, 0], [0, 1]])
+            embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
         return embedding
-        
+
     def call(self, t, dtype=tf.float32):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_freq = tf.cast(t_freq, dtype)
@@ -49,13 +49,20 @@ class FinalLayer(layers.Layer):
     """The final layer of OmniGen."""
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = layers.LayerNormalization(epsilon=1e-6, center=False, scale=False)
-        self.linear = layers.Dense(patch_size * patch_size * out_channels, use_bias=True)
+        self.norm_final = layers.LayerNormalization(
+            epsilon=1e-6,
+            center=False,
+            scale=False
+        )
+        self.linear = layers.Dense(
+            patch_size * patch_size * out_channels,
+            use_bias=True
+        )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('swish'),
             layers.Dense(2 * hidden_size, use_bias=True)
         ])
-        
+
     def call(self, x, c):
         shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=1)
         x = modulate(self.norm_final(x), shift, scale)
@@ -64,275 +71,199 @@ class FinalLayer(layers.Layer):
 
 class PatchEmbedMR(layers.Layer):
     """2D Image to Patch Embedding."""
-    def __init__(self, patch_size=2, in_chans=4, embed_dim=768):
+    def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True):
         super().__init__()
-        self.patch_size = patch_size
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-        
-        # Create the Conv2D layer with correct input shape
-        self.proj = None
-    
-    def build(self, input_shape):
-        # Initialize Conv2D layer when input shape is known
-        self.proj = tf.keras.layers.Conv2D(
-            filters=self.embed_dim,
-            kernel_size=self.patch_size,
-            strides=self.patch_size,
-            padding='valid',
-            input_shape=(None, None, self.in_chans),  # Explicitly specify input shape
-            data_format='channels_last',
-            dtype=tf.float32,
-            name='conv2d'
+        self.proj = layers.Conv2D(
+            filters=embed_dim,
+            kernel_size=patch_size,
+            strides=patch_size,
+            use_bias=bias,
+            data_format='channels_last'
         )
-        # Build the Conv2D layer
-        self.proj.build(input_shape)
-        self.built = True
-    
+
     def call(self, x):
-        if not self.built:
-            self.build(x.shape)
-        # Input is [B, H, W, C], process directly
+        # Input: [B, H, W, C]
         x = self.proj(x)
         # Reshape to [B, H*W, C]
-        B, H, W, C = x.shape
+        B, H, W, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
         x = tf.reshape(x, [B, H * W, C])
         return x
 
-class Transformer(layers.Layer):
-    """Transformer block with pre-norm architecture and memory optimization."""
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dropout_rate=0.0, **kwargs):
-        super().__init__(**kwargs)
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        
-        # Layer normalization with smaller epsilon for stability
-        self.norm1 = layers.LayerNormalization(epsilon=1e-5)
-        self.norm2 = layers.LayerNormalization(epsilon=1e-5)
-        
-        # Multi-head attention with optimized settings
-        self.attn = layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=hidden_size // num_heads,
-            dropout=dropout_rate,
-            use_bias=True,
-            kernel_initializer='glorot_uniform'
-        )
-        
-        # MLP with gradient checkpointing
-        mlp_hidden = int(hidden_size * mlp_ratio)
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(mlp_hidden, use_bias=True, 
-                       kernel_initializer='glorot_uniform'),
-            layers.Activation('gelu'),
-            layers.Dropout(dropout_rate),
-            layers.Dense(hidden_size, use_bias=True,
-                       kernel_initializer='glorot_uniform'),
-            layers.Dropout(dropout_rate)
-        ])
-        
-    def call(self, x, attention_mask=None, kv_cache=None, training=False):
-        # Memory-efficient attention
-        normed_x = self.norm1(x)
-        
-        # Use cached key/value if provided
-        if kv_cache is not None:
-            key, value = kv_cache
-        else:
-            key = value = normed_x
-            
-        # Compute attention with memory optimization
-        attn_output = self.attn(
-            query=normed_x,
-            key=key,
-            value=value,
-            attention_mask=attention_mask,
-            training=training,
-            use_causal_mask=False
-        )
-        
-        # First residual connection
-        x = x + attn_output
-        
-        # Second residual with pre-norm
-        x = x + self.mlp(self.norm2(x), training=training)
-        
-        return x
-
-class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
-    """TensorFlow implementation of OmniGen."""
-    
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        **kwargs
-    ):
+class OmniGenTF(tf.keras.Model):
+    """OmniGen model in TensorFlow."""
+    def __init__(self, config: Dict[str, Any], **kwargs):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.get('hidden_size', 768)
-        self.num_layers = config.get('num_hidden_layers', 12)
-        self.num_heads = config.get('num_attention_heads', 12)
-        self.use_kv_cache = False
-        self.offload_kv_cache = False
         
-        # Create embedders with smaller dummy input
+        # Model configuration
+        self.hidden_size = config.get('hidden_size', 768)
+        self.patch_size = 2
+        self.in_channels = 4
+        self.out_channels = 4
+        self.pos_embed_max_size = 192
+        self.pe_interpolation = 1.0
+        
+        # Create embedders
         self.x_embedder = PatchEmbedMR(
-            patch_size=2,
-            in_chans=4,
-            embed_dim=self.hidden_size
+            self.patch_size, 
+            self.in_channels,
+            self.hidden_size,
+            bias=True
         )
         self.input_x_embedder = PatchEmbedMR(
-            patch_size=2,
-            in_chans=4,
-            embed_dim=self.hidden_size
+            self.patch_size,
+            self.in_channels,
+            self.hidden_size,
+            bias=True
         )
         
-        # Build embedders with smaller test input
-        dummy_input = tf.random.uniform((1, 32, 32, 4))  # Reduced from 64x64
-        _ = self.x_embedder(dummy_input)
-        _ = self.input_x_embedder(dummy_input)
-        
-        # Create other components
+        # Time embeddings
         self.time_token = TimestepEmbedder(self.hidden_size)
         self.t_embedder = TimestepEmbedder(self.hidden_size)
         
         # Position embeddings
         pos_embed = get_2d_sincos_pos_embed(
             self.hidden_size,
-            192,  # pos_embed_max_size
-            interpolation_scale=1.0,
+            self.pos_embed_max_size,
+            interpolation_scale=self.pe_interpolation,
             base_size=64
         )
         self.pos_embed = tf.constant(pos_embed, dtype=tf.float32)[None]
         
         # Final layer
-        self.final_layer = FinalLayer(self.hidden_size, 2, 4)
+        self.final_layer = FinalLayer(
+            self.hidden_size,
+            self.patch_size,
+            self.out_channels
+        )
         
-        # Initialize transformer with memory optimization
-        self.transformer_blocks = []
-        for i in range(self.num_layers):
-            block = Transformer(
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                name=f'transformer_block_{i}'
-            )
-            self.transformer_blocks.append(block)
-        
-        # Build transformer with smaller sequence length
-        dummy_seq = tf.random.uniform((1, 64, self.hidden_size))  # Reduced from 256
-        for block in self.transformer_blocks:
-            _ = block(dummy_seq)
+        # Initialize Phi3 transformer
+        self.llm = Phi3TransformerTF(config)
+        self.llm.use_cache = False
         
         # Initialize weights
         self.initialize_weights()
         
-        # KV cache
-        self.past_key_values = None
-        
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_path: str,
-        adapter_path: Optional[str] = None,
-        **kwargs
-    ) -> "OmniGenTF":
-        """Load pretrained model.
-        
-        Args:
-            pretrained_model_path: Path to pretrained model
-            adapter_path: Path to adapter weights (optional)
-            **kwargs: Additional arguments
-            
-        Returns:
-            Loaded model
-        """
-        if not os.path.exists(pretrained_model_path):
-            pretrained_model_path = snapshot_download(pretrained_model_path)
-            
-        # Load config
-        config_path = os.path.join(pretrained_model_path, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                config = json.load(f)
-        else:
-            config = {}
-            
-        # Update config with kwargs
-        config.update(kwargs)
-        
-        # Create model
-        model = cls(config)
-        
-        # Load weights
-        weight_files = [f for f in os.listdir(pretrained_model_path) if f.endswith(".safetensors")]
-        if not weight_files:
-            raise ValueError(f"No .safetensors files found in {pretrained_model_path}")
-            
-        # Load and convert weights
-        for weight_file in weight_files:
-            weight_path = os.path.join(pretrained_model_path, weight_file)
-            with safe_open(weight_path, framework="pt") as f:
-                for key in f.keys():
-                    tensor = f.get_tensor(key)
-                    tf_tensor = convert_torch_to_tf(tensor)
+    def initialize_weights(self):
+        """Initialize weights following PyTorch implementation."""
+        def _basic_init(layer):
+            if isinstance(layer, layers.Dense):
+                # Use Glorot (Xavier) uniform initialization
+                layer.kernel_initializer = 'glorot_uniform'
+                if layer.use_bias:
+                    layer.bias_initializer = 'zeros'
+            elif isinstance(layer, layers.Conv2D):
+                layer.kernel_initializer = 'glorot_uniform'
+                if layer.use_bias:
+                    layer.bias_initializer = 'zeros'
                     
-                    # Find corresponding layer and set weights
-                    layer_name = key.split(".")[0]
-                    if hasattr(model, layer_name):
-                        layer = getattr(model, layer_name)
-                        if isinstance(layer, tf.keras.layers.Layer):
-                            layer.set_weights([tf_tensor])
-                            
-        # Load adapter if provided
-        if adapter_path is not None:
-            model.load_adapter(adapter_path)
-            
-        return model
+        self.apply(_basic_init)
         
-    def patch_multiple_resolutions(
-        self,
-        x: tf.Tensor,
-        padding_latent: Optional[tf.Tensor] = None,
-        is_input_images: bool = False
-    ) -> Tuple[tf.Tensor, tf.Tensor]:
-        """Process input through patch embedding with shape checks."""
-        # Input shape check
-        tf.debugging.assert_rank(x, 4, message="Input must be rank 4 [batch, height, width, channels]")
-        tf.debugging.assert_equal(tf.shape(x)[-1], self.in_channels, 
-                                message=f"Input must have {self.in_channels} channels")
+    def unpatchify(self, x, h, w):
+        """Reverse patch embedding."""
+        # x: [B, L, patch_size**2 * C]
+        # Return: [B, H, W, C]
+        patch_size = self.patch_size
+        c = self.out_channels
         
-        # Process through embedder
+        B, L, _ = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
+        x = tf.reshape(x, [B, h//patch_size, w//patch_size, patch_size, patch_size, c])
+        x = tf.transpose(x, [0, 1, 3, 2, 4, 5])
+        x = tf.reshape(x, [B, h, w, c])
+        return x
+        
+    def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
+        """Process latents at multiple resolutions."""
         embedder = self.input_x_embedder if is_input_images else self.x_embedder
-        x = embedder(x)
         
-        # Get position embeddings
-        H = W = int(tf.sqrt(float(tf.shape(x)[1])))
-        pos_embed = self.pos_embed[:, :H*W]
+        # Get dimensions
+        B, H, W, C = tf.shape(latents)[0], tf.shape(latents)[1], tf.shape(latents)[2], tf.shape(latents)[3]
         
-        # Shape checks after embedding
-        tf.debugging.assert_rank(x, 3, message="Embedded output must be rank 3 [batch, tokens, channels]")
-        tf.debugging.assert_equal(tf.shape(x)[-1], self.hidden_size,
-                                message=f"Embedded output must have hidden_size={self.hidden_size}")
+        # Embed latents
+        x = embedder(latents)
+        
+        # Get position embeddings for this resolution
+        pos_embed = self.pos_embed[:, :H*W//4]  # Divide by 4 due to patch size of 2
         
         return x, pos_embed
+
+    def call(
+        self,
+        x,
+        timestep,
+        input_ids=None,
+        input_img_latents=None,
+        input_image_sizes=None,
+        attention_mask=None,
+        position_ids=None,
+        padding_latent=None,
+        past_key_values=None,
+        return_past_key_values=True,
+        offload_model=False
+    ):
+        """Forward pass matching PyTorch implementation."""
+        # Process input through patch embedding
+        x, pos_embed = self.patch_multiple_resolutions(x, padding_latent)
+        x = x + tf.cast(pos_embed, x.dtype)
+        
+        # Get timestep embedding
+        t_emb = self.t_embedder(timestep)
+        
+        # Process input images if provided
+        if input_img_latents is not None:
+            input_x, _ = self.patch_multiple_resolutions(
+                input_img_latents,
+                padding_latent,
+                is_input_images=True
+            )
+            x = tf.concat([x, input_x], axis=1)
+        
+        # Add time token
+        time_token = self.time_token(timestep)
+        time_token = tf.expand_dims(time_token, axis=1)
+        x = tf.concat([time_token, x], axis=1)
+        
+        # Process through transformer
+        hidden_states = self.llm(
+            input_ids=input_ids,
+            inputs_embeds=x,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=return_past_key_values,
+            training=False
+        )
+        
+        if return_past_key_values:
+            x = hidden_states[0]
+            past_key_values = hidden_states[1]
+        else:
+            x = hidden_states[0]
+            past_key_values = None
+            
+        # Final layer processing
+        x = self.final_layer(x[:, 1:], t_emb)  # Remove time token
+        
+        if return_past_key_values:
+            return x, past_key_values
+        return x
         
     def forward_with_cfg(
         self,
-        x: tf.Tensor,
-        timestep: tf.Tensor,
-        input_ids: Optional[tf.Tensor] = None,
-        input_img_latents: Optional[tf.Tensor] = None,
-        input_image_sizes: Optional[tf.Tensor] = None,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        cfg_scale: float = 3.0,
-        use_img_cfg: bool = True,
-        img_cfg_scale: float = 1.6,
-        past_key_values: Optional[List[Tuple[tf.Tensor]]] = None,
-        use_kv_cache: bool = True,
-        offload_model: bool = False
-    ) -> tf.Tensor:
-        """Forward pass with classifier-free guidance."""
+        x,
+        timestep,
+        input_ids=None,
+        input_img_latents=None,
+        input_image_sizes=None,
+        attention_mask=None,
+        position_ids=None,
+        cfg_scale=3.0,
+        use_img_cfg=True,
+        img_cfg_scale=1.6,
+        past_key_values=None,
+        use_kv_cache=True,
+        offload_model=False
+    ):
+        """Forward with classifier-free guidance."""
         # Double the batch for CFG
         x_in = tf.concat([x] * 2, axis=0)
         t_in = tf.concat([timestep] * 2, axis=0)
@@ -350,23 +281,35 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
             img_latents_in = tf.concat([input_img_latents, tf.zeros_like(input_img_latents)], axis=0)
             img_sizes_in = tf.concat([input_image_sizes, tf.zeros_like(input_image_sizes)], axis=0) if input_image_sizes is not None else None
         else:
-            img_latents_in = input_img_latents
-            img_sizes_in = input_image_sizes
+            img_latents_in = None
+            img_sizes_in = None
             
         # Get predictions
-        noise_pred = self.call(
-            x_in,
-            t_in,
-            input_ids_in,
-            img_latents_in,
-            img_sizes_in,
-            attention_mask_in,
-            position_ids_in,
-            past_key_values=past_key_values,
-            use_kv_cache=use_kv_cache,
-            offload_model=offload_model
-        )
-        
+        if use_kv_cache and past_key_values is not None:
+            noise_pred, past_key_values = self(
+                x_in, t_in,
+                input_ids_in,
+                img_latents_in,
+                img_sizes_in,
+                attention_mask_in,
+                position_ids_in,
+                past_key_values=past_key_values,
+                return_past_key_values=True,
+                offload_model=offload_model
+            )
+        else:
+            noise_pred = self(
+                x_in, t_in,
+                input_ids_in,
+                img_latents_in,
+                img_sizes_in,
+                attention_mask_in,
+                position_ids_in,
+                past_key_values=None,
+                return_past_key_values=False,
+                offload_model=offload_model
+            )
+            
         # Split predictions
         noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2, axis=0)
         
@@ -377,137 +320,9 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
             noise_pred_img = noise_pred_text  # Use text-conditioned prediction for image guidance
             noise_pred = noise_pred + img_cfg_scale * (noise_pred_img - noise_pred)
             
+        if use_kv_cache and past_key_values is not None:
+            return noise_pred, past_key_values
         return noise_pred
-        
-    def forward_with_separate_cfg(
-        self,
-        x: tf.Tensor,
-        timestep: tf.Tensor,
-        input_ids: Optional[tf.Tensor] = None,
-        input_img_latents: Optional[tf.Tensor] = None,
-        input_image_sizes: Optional[tf.Tensor] = None,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        cfg_scale: float = 3.0,
-        use_img_cfg: bool = True,
-        img_cfg_scale: float = 1.6,
-        past_key_values: Optional[List[Tuple[tf.Tensor]]] = None,
-        use_kv_cache: bool = True,
-        offload_model: bool = False
-    ) -> tf.Tensor:
-        """Forward pass with separate classifier-free guidance."""
-        # Get unconditional prediction
-        noise_pred_uncond = self.call(
-            x,
-            timestep,
-            None,
-            None,
-            None,
-            None,
-            None,
-            past_key_values=past_key_values,
-            use_kv_cache=use_kv_cache,
-            offload_model=offload_model
-        )
-        
-        # Get text-conditioned prediction
-        noise_pred_text = self.call(
-            x,
-            timestep,
-            input_ids,
-            None,
-            None,
-            attention_mask,
-            position_ids,
-            past_key_values=past_key_values,
-            use_kv_cache=use_kv_cache,
-            offload_model=offload_model
-        )
-        
-        # Apply classifier-free guidance
-        noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
-        
-        if input_img_latents is not None and use_img_cfg:
-            # Get image-conditioned prediction
-            noise_pred_img = self.call(
-                x,
-                timestep,
-                input_ids,
-                input_img_latents,
-                input_image_sizes,
-                attention_mask,
-                position_ids,
-                past_key_values=past_key_values,
-                use_kv_cache=use_kv_cache,
-                offload_model=offload_model
-            )
-            noise_pred = noise_pred + img_cfg_scale * (noise_pred_img - noise_pred)
-            
-        return noise_pred
-        
-    def call(
-        self,
-        x: tf.Tensor,
-        timesteps: tf.Tensor,
-        input_ids: Optional[tf.Tensor] = None,
-        input_img_latents: Optional[tf.Tensor] = None,
-        input_image_sizes: Optional[tf.Tensor] = None,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_values: Optional[List[Tuple[tf.Tensor]]] = None,
-        use_kv_cache: bool = True,
-        offload_model: bool = False,
-        training: bool = False
-    ) -> tf.Tensor:
-        """Model forward pass with shape validation."""
-        batch_size = tf.shape(x)[0]
-        
-        # Input validation
-        tf.debugging.assert_rank(timesteps, 1, message="Timesteps must be rank 1")
-        tf.debugging.assert_equal(tf.shape(timesteps)[0], batch_size,
-                                message="Timesteps batch size must match input")
-        
-        # Process patches
-        x, pos_embed = self.patch_multiple_resolutions(x)
-        x = x + tf.cast(pos_embed, x.dtype)
-        
-        # Validate embeddings
-        tf.debugging.assert_equal(tf.shape(x)[-1], self.hidden_size,
-                                message="Hidden size mismatch after position embedding")
-        
-        # Process timesteps
-        t_emb = self.t_embedder(timesteps)
-        tf.debugging.assert_equal(tf.shape(t_emb)[-1], self.hidden_size,
-                                message="Timestep embedding dimension mismatch")
-        
-        # Handle input images
-        if input_img_latents is not None:
-            input_x, _ = self.patch_multiple_resolutions(input_img_latents, is_input_images=True)
-            tf.debugging.assert_equal(tf.shape(input_x)[-1], self.hidden_size,
-                                    message="Input image embedding dimension mismatch")
-            x = tf.concat([x, input_x], axis=1)
-        
-        # Add time token
-        time_token = self.time_token(timesteps)
-        time_token = tf.expand_dims(time_token, axis=1)
-        x = tf.concat([time_token, x], axis=1)
-        
-        # Process through transformer
-        for i, block in enumerate(self.transformer_blocks):
-            x = block(x, attention_mask=attention_mask, 
-                     kv_cache=past_key_values[i] if past_key_values is not None else None)
-            tf.debugging.assert_equal(tf.shape(x)[-1], self.hidden_size,
-                                    message=f"Hidden size mismatch after transformer block {i}")
-        
-        # Final processing
-        x = self.final_layer(x[:, 1:], t_emb)
-        
-        # Validate output shape
-        expected_shape = [batch_size, -1, self.out_channels]
-        tf.debugging.assert_equal(tf.shape(x)[-1], self.out_channels,
-                                message="Output channels mismatch")
-        
-        return x
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
     """Generate 2D sinusoidal positional embeddings."""

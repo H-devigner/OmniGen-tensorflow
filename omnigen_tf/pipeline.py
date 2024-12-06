@@ -8,6 +8,7 @@ import time
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 import logging
+import inspect
 
 from .model import OmniGenTF
 from .scheduler import OmniGenScheduler
@@ -208,131 +209,120 @@ class OmniGenPipeline:
     def __call__(
         self,
         prompt: Union[str, List[str]],
-        input_images: Optional[Union[List[str], List[List[str]]]] = None,
-        height: int = 1024,
-        width: int = 1024,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 3.0,
         use_img_guidance: bool = True,
         img_guidance_scale: float = 1.6,
-        max_input_image_size: int = 1024,
-        separate_cfg_infer: bool = True,
-        offload_model: bool = False,
-        use_kv_cache: bool = True,
-        offload_kv_cache: bool = False,
-        use_input_image_size_as_output: bool = False,
-        seed: Optional[int] = None,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: int = 1,
+        eta: float = 0.0,
+        generator: Optional[tf.random.Generator] = None,
+        latents: Optional[tf.Tensor] = None,
         output_type: str = "pil",
-    ) -> List[Image.Image]:
-        """Generate images from text prompt.
+        return_dict: bool = True,
+        callback: Optional[callable] = None,
+        callback_steps: int = 1,
+        **kwargs
+    ):
+        """Generate images from text prompt."""
         
-        Args:
-            prompt: Text prompt(s)
-            input_images: Optional input reference images
-            height: Output height
-            width: Output width
-            num_inference_steps: Number of denoising steps
-            guidance_scale: Classifier-free guidance scale
-            use_img_guidance: Whether to use image guidance
-            img_guidance_scale: Image guidance scale
-            max_input_image_size: Maximum size for input images
-            separate_cfg_infer: Whether to run CFG inference separately
-            offload_model: Whether to offload model to CPU
-            use_kv_cache: Whether to use KV caching
-            offload_kv_cache: Whether to offload KV cache
-            use_input_image_size_as_output: Use input image size as output
-            seed: Random seed
-            output_type: Output format ("pil" or "tensor")
-            
-        Returns:
-            List of generated images
-        """
-        # Input validation
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError("Height and width must be multiples of 8")
-            
-        if isinstance(prompt, str):
-            prompt = [prompt]
-        batch_size = len(prompt)
+        # 0. Process inputs
+        device = self.device
+        batch_size = 1
+        if isinstance(prompt, list):
+            batch_size = len(prompt)
         
-        # Process input images if provided
-        input_latents = None
-        if input_images is not None:
-            if isinstance(input_images[0], str):
-                input_images = [input_images]
-            input_latents = []
-            for img_list in input_images:
-                img_latents = []
-                for img_path in img_list:
-                    img = Image.open(img_path).convert("RGB")
-                    img = tf.convert_to_tensor(np.array(img))
-                    img = tf.image.resize(img, (max_input_image_size, max_input_image_size))
-                    img = (img / 127.5) - 1.0
-                    latents = self.vae_encode(img[None])
-                    img_latents.append(latents)
-                input_latents.append(img_latents)
+        height = height or 1024
+        width = width or 1024
         
-        # Set up memory optimization
-        if offload_model:
-            self.enable_model_cpu_offload()
-        self.use_kv_cache = use_kv_cache
-        self.offload_kv_cache = offload_kv_cache
-        
-        # Prepare initial latents
-        latents = self.prepare_latents(
-            batch_size=batch_size,
-            height=height,
-            width=width,
-            seed=seed
+        # 1. Process text
+        text_inputs = self.processor(
+            prompt,
+            padding=True,
+            max_length=77,
+            truncation=True,
+            return_tensors="tf"
         )
+        input_ids = text_inputs.input_ids
+        attention_mask = text_inputs.attention_mask
+        position_ids = tf.range(0, tf.shape(input_ids)[1])[None].repeat(batch_size, axis=0)
         
-        # Set up scheduler
+        # 2. Define timesteps
         self.scheduler.set_timesteps(num_inference_steps)
         timesteps = self.scheduler.timesteps
         
-        # Generation loop
-        for t in timesteps:
-            # Move model to device if needed
-            if self.model_cpu_offload:
-                self.model.to(self.device)
+        # 3. Prepare latents
+        latents_shape = (batch_size, height//8, width//8, 4)
+        if latents is None:
+            latents = tf.random.normal(
+                latents_shape,
+                seed=generator.seed() if generator else None,
+                dtype=tf.float32
+            )
+        
+        # 4. Prepare extra parameters
+        extra_step_kwargs = {}
+        if "eta" in inspect.signature(self.scheduler.step).parameters:
+            extra_step_kwargs["eta"] = eta
+            
+        # 5. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        past_key_values = None
+        
+        with tf.device(device):
+            for i, t in enumerate(timesteps):
+                # Expand latents for classifier-free guidance
+                latent_model_input = tf.concat([latents] * 2, axis=0)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
-            # Prepare model inputs
-            model_input = {
-                "sample": latents,
-                "timestep": tf.fill((batch_size,), t),
-                "encoder_hidden_states": None,  # Add text embeddings here
-                "input_image_latents": input_latents
-            }
-            
-            # Model inference
-            if separate_cfg_infer:
-                noise_pred = self.model.forward_with_separate_cfg(
-                    **model_input,
-                    guidance_scale=guidance_scale,
-                    use_img_guidance=use_img_guidance,
-                    img_guidance_scale=img_guidance_scale
-                )
-            else:
-                noise_pred = self.model.forward_with_cfg(
-                    **model_input,
-                    guidance_scale=guidance_scale,
-                    use_img_guidance=use_img_guidance,
-                    img_guidance_scale=img_guidance_scale
-                )
-            
-            # Scheduler step
-            latents = self.scheduler.step(noise_pred, t, latents)
-            
-            # Offload model if needed
-            if self.model_cpu_offload:
-                self.model.to("CPU:0")
+                # Predict noise residual
+                if self.use_kv_cache and past_key_values is not None:
+                    noise_pred, past_key_values = self.model.forward_with_cfg(
+                        latent_model_input,
+                        tf.repeat(t, batch_size),
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        cfg_scale=guidance_scale,
+                        use_img_cfg=use_img_guidance,
+                        img_cfg_scale=img_guidance_scale,
+                        past_key_values=past_key_values,
+                        use_kv_cache=True,
+                        offload_model=self.model_cpu_offload
+                    )
+                else:
+                    noise_pred = self.model.forward_with_cfg(
+                        latent_model_input,
+                        tf.repeat(t, batch_size),
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        cfg_scale=guidance_scale,
+                        use_img_cfg=use_img_guidance,
+                        img_cfg_scale=img_guidance_scale,
+                        past_key_values=None,
+                        use_kv_cache=False,
+                        offload_model=self.model_cpu_offload
+                    )
+                
+                # Compute previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                
+                # Call callback if needed
+                if callback is not None and i % callback_steps == 0:
+                    callback(i, t, latents)
         
-        # Decode latents
-        images = self.vae_decode(latents)
-        images = ((images + 1) * 127.5).numpy().astype(np.uint8)
+        # 6. Post-processing
+        image = self.vae.decode(latents / 0.18215).sample
+        image = (image / 2 + 0.5).clip(0, 1)
         
-        # Convert to PIL
+        # 7. Convert to output format
+        image = tf.transpose(image, [0, 2, 3, 1])
+        
         if output_type == "pil":
-            images = [Image.fromarray(img) for img in images]
+            image = tf.cast(image * 255, tf.uint8)
+            image = [Image.fromarray(img.numpy()) for img in image]
             
-        return images
+        return image
