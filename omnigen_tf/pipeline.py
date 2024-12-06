@@ -1,16 +1,21 @@
 """OmniGen pipeline for text-to-image generation."""
+
+# Standard library imports
 import os
-import tensorflow as tf
-from PIL import Image
-import numpy as np
-from typing import List, Union, Optional, Dict, Any, Callable
 import time
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
 import logging
 import inspect
-from tqdm.auto import tqdm
+from typing import List, Union, Optional, Dict, Any, Callable, Tuple
 
+# Third-party imports
+import tensorflow as tf
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+
+# Local imports
 from .model import OmniGenTF
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
@@ -40,10 +45,10 @@ class OmniGenPipeline:
     def __init__(
         self,
         model: OmniGenTF,
-        vae: AutoencoderKL,
+        vae: "AutoencoderKL",
         processor: OmniGenProcessor,
-        device: str = None
-    ):
+        device: Optional[str] = None
+    ) -> None:
         """Initialize OmniGen pipeline.
         
         Args:
@@ -142,7 +147,7 @@ class OmniGenPipeline:
         use_img_guidance: bool = False,
         img_guidance_scale: float = 1.6,
         guidance_image: Optional[Union[Image.Image, List[Image.Image]]] = None,
-    ):
+    ) -> Union[List[Image.Image], Dict[str, List[Image.Image]]]:
         """Generate images from text prompt.
         
         Args:
