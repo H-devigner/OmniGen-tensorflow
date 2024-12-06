@@ -47,8 +47,13 @@ class OmniGenTFProcessor:
 
     def add_prefix_instruction(self, prompt):
         """Add instruction prefix to the prompt."""
-        user_prompt = 'Generate an image based on the following prompt: ' + prompt
-        return user_prompt
+        if isinstance(prompt, str):
+            user_prompt = 'Create an image based on the following prompt: ' + prompt
+            return user_prompt
+        elif isinstance(prompt, list):
+            return ['Create an image based on the following prompt: ' + p for p in prompt]
+        else:
+            raise ValueError("Prompt must be a string or list of strings")
 
     def process_text(self, prompt):
         """Process a single text prompt."""
