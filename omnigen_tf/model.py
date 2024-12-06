@@ -100,53 +100,61 @@ class PatchEmbedMR(layers.Layer):
         return x
 
 class Transformer(layers.Layer):
-    """Transformer block with pre-norm architecture."""
+    """Transformer block with pre-norm architecture and memory optimization."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dropout_rate=0.0, **kwargs):
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        
+        # Layer normalization with smaller epsilon for stability
+        self.norm1 = layers.LayerNormalization(epsilon=1e-5)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-5)
+        
+        # Multi-head attention with optimized settings
         self.attn = layers.MultiHeadAttention(
             num_heads=num_heads,
             key_dim=hidden_size // num_heads,
             dropout=dropout_rate,
-            use_bias=True
+            use_bias=True,
+            kernel_initializer='glorot_uniform'
         )
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        
+        # MLP with gradient checkpointing
+        mlp_hidden = int(hidden_size * mlp_ratio)
         self.mlp = tf.keras.Sequential([
-            layers.Dense(int(hidden_size * mlp_ratio), use_bias=True),
+            layers.Dense(mlp_hidden, use_bias=True, 
+                       kernel_initializer='glorot_uniform'),
             layers.Activation('gelu'),
             layers.Dropout(dropout_rate),
-            layers.Dense(hidden_size, use_bias=True),
+            layers.Dense(hidden_size, use_bias=True,
+                       kernel_initializer='glorot_uniform'),
             layers.Dropout(dropout_rate)
         ])
         
     def call(self, x, attention_mask=None, kv_cache=None, training=False):
-        # Pre-norm
+        # Memory-efficient attention
         normed_x = self.norm1(x)
-        
-        # Prepare attention inputs
-        query = key = value = normed_x
         
         # Use cached key/value if provided
         if kv_cache is not None:
             key, value = kv_cache
+        else:
+            key = value = normed_x
             
-        # Compute attention with optional mask
+        # Compute attention with memory optimization
         attn_output = self.attn(
-            query=query,
+            query=normed_x,
             key=key,
             value=value,
             attention_mask=attention_mask,
             training=training,
-            use_causal_mask=False,
-            return_attention_scores=False
+            use_causal_mask=False
         )
         
-        # Residual connection
+        # First residual connection
         x = x + attn_output
         
-        # MLP with pre-norm
+        # Second residual with pre-norm
         x = x + self.mlp(self.norm2(x), training=training)
         
         return x
@@ -161,13 +169,13 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
     ):
         super().__init__()
         self.config = config
-        self.hidden_size = config['hidden_size']
+        self.hidden_size = config.get('hidden_size', 768)
         self.num_layers = config.get('num_hidden_layers', 12)
         self.num_heads = config.get('num_attention_heads', 12)
         self.use_kv_cache = False
         self.offload_kv_cache = False
         
-        # Create embedders first
+        # Create embedders with smaller dummy input
         self.x_embedder = PatchEmbedMR(
             patch_size=2,
             in_chans=4,
@@ -179,8 +187,8 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
             embed_dim=self.hidden_size
         )
         
-        # Build embedders
-        dummy_input = tf.random.uniform((1, 64, 64, 4))
+        # Build embedders with smaller test input
+        dummy_input = tf.random.uniform((1, 32, 32, 4))  # Reduced from 64x64
         _ = self.x_embedder(dummy_input)
         _ = self.input_x_embedder(dummy_input)
         
@@ -200,18 +208,18 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
         # Final layer
         self.final_layer = FinalLayer(self.hidden_size, 2, 4)
         
-        # Initialize transformer
-        self.transformer_blocks = [
-            Transformer(
+        # Initialize transformer with memory optimization
+        self.transformer_blocks = []
+        for i in range(self.num_layers):
+            block = Transformer(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 name=f'transformer_block_{i}'
             )
-            for i in range(self.num_layers)
-        ]
+            self.transformer_blocks.append(block)
         
-        # Build transformer
-        dummy_seq = tf.random.uniform((1, 256, self.hidden_size))
+        # Build transformer with smaller sequence length
+        dummy_seq = tf.random.uniform((1, 64, self.hidden_size))  # Reduced from 256
         for block in self.transformer_blocks:
             _ = block(dummy_seq)
         

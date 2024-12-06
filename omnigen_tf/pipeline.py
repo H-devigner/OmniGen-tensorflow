@@ -54,44 +54,73 @@ class OmniGenPipeline:
     def from_pretrained(
         cls,
         model_name: str,
-        vae_path: str = None,
+        vae_path: Optional[str] = None,
         max_retries: int = 3,
-        retry_delay: int = 3600
-    ):
-        """Initialize pipeline from pre-trained model.
+        retry_delay: float = 1.0,
+        mixed_precision: bool = True,
+        **kwargs
+    ) -> "OmniGenPipeline":
+        """Initialize pipeline with memory optimization."""
         
-        Args:
-            model_name: Name of the pre-trained model
-            vae_path: Path to VAE weights (optional)
-            max_retries: Maximum number of retries for rate limit errors
-            retry_delay: Delay in seconds between retries
-        """
+        # Enable mixed precision for memory efficiency
+        if mixed_precision:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+        
+        # Set memory growth to avoid OOM
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError as e:
+                print(f"Memory growth setting failed: {e}")
+        
         for attempt in range(max_retries):
             try:
-                # Download and load model
+                # Download and load model with optimized settings
                 model_path = snapshot_download(model_name)
-                model = OmniGenTF.from_pretrained(model_path)
+                model = OmniGenTF.from_pretrained(
+                    model_path,
+                    use_mixed_precision=mixed_precision,
+                    **kwargs
+                )
                 
-                # Load VAE
+                # Load VAE with optimization
                 if vae_path is None:
                     vae_path = os.path.join(model_path, "vae")
-                vae = AutoencoderKL.from_pretrained(vae_path)
+                    if os.path.exists(vae_path):
+                        vae = AutoencoderKL.from_pretrained(
+                            vae_path,
+                            use_mixed_precision=mixed_precision
+                        )
+                    else:
+                        print("No VAE found in model, using default")
+                        vae = AutoencoderKL.from_pretrained(
+                            "stabilityai/sdxl-vae",
+                            use_mixed_precision=mixed_precision
+                        )
+                else:
+                    vae = AutoencoderKL.from_pretrained(
+                        vae_path,
+                        use_mixed_precision=mixed_precision
+                    )
                 
-                # Create scheduler
-                scheduler = OmniGenScheduler()
+                # Initialize processor
+                processor = OmniGenTFProcessor.from_pretrained(model_path)
                 
                 return cls(
                     model=model,
                     vae=vae,
-                    scheduler=scheduler
+                    processor=processor,
+                    **kwargs
                 )
                 
             except Exception as e:
-                if "rate limit exceeded" in str(e).lower() and attempt < max_retries - 1:
-                    logger.warning(f"Rate limit exceeded, retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
+                if attempt == max_retries - 1:
                     raise e
+                print(f"Attempt {attempt + 1} failed, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
     
     def enable_model_cpu_offload(self):
         """Enable CPU offloading for model."""
