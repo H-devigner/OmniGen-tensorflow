@@ -80,6 +80,7 @@ class PatchEmbedMR(layers.Layer):
             kernel_size=self.patch_size,
             strides=self.patch_size,
             padding='valid',
+            input_shape=(None, None, self.in_chans),  # Explicitly specify input shape
             data_format='channels_last',
             dtype=tf.float32,
             name='conv2d'
@@ -91,8 +92,7 @@ class PatchEmbedMR(layers.Layer):
     def call(self, x):
         if not self.built:
             self.build(x.shape)
-        # Input is [B, H, W, C], which is already in TensorFlow's channels_last format
-        # No need to transpose
+        # Input is [B, H, W, C], process directly
         x = self.proj(x)
         # Reshape to [B, H*W, C]
         B, H, W, C = x.shape
@@ -103,29 +103,51 @@ class Transformer(layers.Layer):
     """Transformer block with pre-norm architecture."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dropout_rate=0.0, **kwargs):
         super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
         self.attn = layers.MultiHeadAttention(
             num_heads=num_heads,
             key_dim=hidden_size // num_heads,
-            dropout=dropout_rate
+            dropout=dropout_rate,
+            use_bias=True
         )
         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
         self.mlp = tf.keras.Sequential([
-            layers.Dense(int(hidden_size * mlp_ratio)),
+            layers.Dense(int(hidden_size * mlp_ratio), use_bias=True),
             layers.Activation('gelu'),
             layers.Dropout(dropout_rate),
-            layers.Dense(hidden_size),
+            layers.Dense(hidden_size, use_bias=True),
             layers.Dropout(dropout_rate)
         ])
         
-    def call(self, x, training=False):
-        # Attention
-        attn_output = self.attn(self.norm1(x), self.norm1(x), training=training)
+    def call(self, x, attention_mask=None, kv_cache=None, training=False):
+        # Pre-norm
+        normed_x = self.norm1(x)
+        
+        # Prepare attention inputs
+        query = key = value = normed_x
+        
+        # Use cached key/value if provided
+        if kv_cache is not None:
+            key, value = kv_cache
+            
+        # Compute attention with optional mask
+        attn_output = self.attn(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            training=training,
+            use_causal_mask=False,
+            return_attention_scores=False
+        )
+        
+        # Residual connection
         x = x + attn_output
         
-        # MLP
-        mlp_output = self.mlp(self.norm2(x), training=training)
-        x = x + mlp_output
+        # MLP with pre-norm
+        x = x + self.mlp(self.norm2(x), training=training)
         
         return x
 
@@ -261,29 +283,28 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
         
     def patch_multiple_resolutions(
         self,
-        latents: tf.Tensor,
+        x: tf.Tensor,
         padding_latent: Optional[tf.Tensor] = None,
         is_input_images: bool = False
     ) -> Tuple[tf.Tensor, tf.Tensor]:
-        """Process latents at multiple resolutions."""
+        """Process input through patch embedding with shape checks."""
+        # Input shape check
+        tf.debugging.assert_rank(x, 4, message="Input must be rank 4 [batch, height, width, channels]")
+        tf.debugging.assert_equal(tf.shape(x)[-1], self.in_channels, 
+                                message=f"Input must have {self.in_channels} channels")
+        
+        # Process through embedder
         embedder = self.input_x_embedder if is_input_images else self.x_embedder
-        
-        # Get latent dimensions
-        batch_size = tf.shape(latents)[0]
-        height = tf.shape(latents)[1]
-        width = tf.shape(latents)[2]
-        
-        # Embed latents
-        x = embedder(latents)
+        x = embedder(x)
         
         # Get position embeddings
-        pos_embed = self.cropped_pos_embed(height, width)
+        H = W = int(tf.sqrt(float(tf.shape(x)[1])))
+        pos_embed = self.pos_embed[:, :H*W]
         
-        # Add position embeddings
-        x = x + pos_embed
-        
-        # Reshape to sequence
-        x = tf.reshape(x, [batch_size, -1, self.hidden_size])
+        # Shape checks after embedding
+        tf.debugging.assert_rank(x, 3, message="Embedded output must be rank 3 [batch, tokens, channels]")
+        tf.debugging.assert_equal(tf.shape(x)[-1], self.hidden_size,
+                                message=f"Embedded output must have hidden_size={self.hidden_size}")
         
         return x, pos_embed
         
@@ -430,52 +451,53 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
         offload_model: bool = False,
         training: bool = False
     ) -> tf.Tensor:
-        """Model forward pass."""
-        # Process input latents
+        """Model forward pass with shape validation."""
+        batch_size = tf.shape(x)[0]
+        
+        # Input validation
+        tf.debugging.assert_rank(timesteps, 1, message="Timesteps must be rank 1")
+        tf.debugging.assert_equal(tf.shape(timesteps)[0], batch_size,
+                                message="Timesteps batch size must match input")
+        
+        # Process patches
         x, pos_embed = self.patch_multiple_resolutions(x)
+        x = x + tf.cast(pos_embed, x.dtype)
         
-        # Get timestep embeddings
+        # Validate embeddings
+        tf.debugging.assert_equal(tf.shape(x)[-1], self.hidden_size,
+                                message="Hidden size mismatch after position embedding")
+        
+        # Process timesteps
         t_emb = self.t_embedder(timesteps)
+        tf.debugging.assert_equal(tf.shape(t_emb)[-1], self.hidden_size,
+                                message="Timestep embedding dimension mismatch")
         
-        # Process input images if provided
+        # Handle input images
         if input_img_latents is not None:
             input_x, _ = self.patch_multiple_resolutions(input_img_latents, is_input_images=True)
+            tf.debugging.assert_equal(tf.shape(input_x)[-1], self.hidden_size,
+                                    message="Input image embedding dimension mismatch")
             x = tf.concat([x, input_x], axis=1)
-            
+        
         # Add time token
         time_token = self.time_token(timesteps)
         time_token = tf.expand_dims(time_token, axis=1)
         x = tf.concat([time_token, x], axis=1)
         
-        # Apply transformer blocks
+        # Process through transformer
         for i, block in enumerate(self.transformer_blocks):
-            if offload_model:
-                block.to("GPU:0")
-                
-            if use_kv_cache and past_key_values is not None:
-                kv_cache = past_key_values[i]
-            else:
-                kv_cache = None
-                
-            x = block(x, kv_cache=kv_cache)
-            
-            if offload_model:
-                block.to("CPU:0")
-                
-            if use_kv_cache:
-                if self.past_key_values is None:
-                    self.past_key_values = [None] * len(self.transformer_blocks)
-                self.past_key_values[i] = x
-                
-        # Apply final layer
-        x = self.final_layer(x[:, 1:], t_emb)  # Remove time token
+            x = block(x, attention_mask=attention_mask, 
+                     kv_cache=past_key_values[i] if past_key_values is not None else None)
+            tf.debugging.assert_equal(tf.shape(x)[-1], self.hidden_size,
+                                    message=f"Hidden size mismatch after transformer block {i}")
         
-        # Reshape output
-        batch_size = tf.shape(x)[0]
-        sequence_length = tf.shape(x)[1]
-        x = tf.reshape(x, [batch_size, sequence_length, 2, 2, 4])
-        x = tf.transpose(x, [0, 1, 3, 2, 4])
-        x = tf.reshape(x, [batch_size, -1, 4])
+        # Final processing
+        x = self.final_layer(x[:, 1:], t_emb)
+        
+        # Validate output shape
+        expected_shape = [batch_size, -1, self.out_channels]
+        tf.debugging.assert_equal(tf.shape(x)[-1], self.out_channels,
+                                message="Output channels mismatch")
         
         return x
 
