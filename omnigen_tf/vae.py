@@ -43,227 +43,252 @@ class AutoencoderKL(tf.keras.Model):
         kernel_init = initializers.TruncatedNormal(stddev=0.02)
         
         # Build encoder
-        self.encoder = self.build_encoder(
+        self.conv_in = layers.Conv2D(
+            block_out_channels[0],
+            kernel_size=3,
+            strides=1,
+            padding='same',
             kernel_initializer=kernel_init,
-            bias_initializer='zeros'
+            name='conv_in'
+        )
+        
+        self.encoder_blocks = []
+        output_channel = block_out_channels[0]
+        
+        for i, (block_type, channel) in enumerate(zip(down_block_types, block_out_channels)):
+            input_channel = output_channel
+            output_channel = channel
+            
+            # Add encoder block
+            for _ in range(layers_per_block):
+                block = self._make_encoder_block(
+                    block_type,
+                    input_channel,
+                    output_channel,
+                    kernel_init,
+                    name=f'encoder_block_{i}'
+                )
+                self.encoder_blocks.append(block)
+                input_channel = output_channel
+                
+        self.conv_norm_out = layers.LayerNormalization(epsilon=1e-5, name='conv_norm_out')
+        if act_fn == "silu":
+            self.conv_act = layers.Activation('swish')
+        else:
+            self.conv_act = layers.Activation(act_fn)
+            
+        self.conv_out = layers.Conv2D(
+            latent_channels,
+            kernel_size=3,
+            strides=1,
+            padding='same',
+            kernel_initializer=kernel_init,
+            name='conv_out'
         )
         
         # Build decoder
-        self.decoder = self.build_decoder(
-            kernel_initializer=kernel_init,
-            bias_initializer='zeros'
-        )
+        self.decoder_blocks = []
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        reversed_up_block_types = list(reversed(up_block_types))
+        output_channel = reversed_block_out_channels[0]
         
-        # Build the model
-        self.build((None, None, None, in_channels))
-        
-    def build(self, input_shape):
-        """Build the model and initialize weights."""
-        super().build(input_shape)
-        
-        # Initialize all layers
-        for layer in self.layers:
-            if hasattr(layer, 'kernel_initializer'):
-                layer.kernel.assign(
-                    layer.kernel_initializer(layer.kernel.shape)
-                )
-            if hasattr(layer, 'bias_initializer') and layer.use_bias:
-                layer.bias.assign(
-                    layer.bias_initializer(layer.bias.shape)
-                )
-
-    def build_encoder(self, kernel_initializer, bias_initializer):
-        """Build encoder network."""
-        layers = []
-        in_channels = self.in_channels
-        
-        # Initial convolution
-        layers.append(
-            tf.keras.layers.Conv2D(
-                self.block_out_channels[0],
-                kernel_size=3,
-                strides=1,
-                padding="same",
-                kernel_initializer=kernel_initializer,
-                bias_initializer=bias_initializer,
-                name="conv_in"
-            )
-        )
-        
-        # Down blocks
-        output_channel = self.block_out_channels[0]
-        for i, down_block_type in enumerate(self.down_block_types):
+        for i, (block_type, channel) in enumerate(zip(reversed_up_block_types, reversed_block_out_channels)):
             input_channel = output_channel
-            output_channel = self.block_out_channels[min(i + 1, len(self.block_out_channels) - 1)]
-            is_final_block = i == len(self.down_block_types) - 1
+            output_channel = channel
             
-            down_block = []
-            
-            # Add layers
-            for _ in range(self.layers_per_block):
-                down_block.append(
-                    tf.keras.layers.Conv2D(
-                        output_channel,
-                        kernel_size=3,
-                        strides=2 if not is_final_block else 1,
-                        padding="same",
-                        kernel_initializer=kernel_initializer,
-                        bias_initializer=bias_initializer
-                    )
+            # Add decoder block
+            for _ in range(layers_per_block):
+                block = self._make_decoder_block(
+                    block_type,
+                    input_channel,
+                    output_channel,
+                    kernel_init,
+                    name=f'decoder_block_{i}'
                 )
-                down_block.append(tf.keras.layers.Activation(self.act_fn))
+                self.decoder_blocks.append(block)
+                input_channel = output_channel
                 
-            layers.extend(down_block)
+        self.conv_norm_out_decoder = layers.LayerNormalization(epsilon=1e-5, name='conv_norm_out_decoder')
+        if act_fn == "silu":
+            self.conv_act_decoder = layers.Activation('swish')
+        else:
+            self.conv_act_decoder = layers.Activation(act_fn)
             
-        return tf.keras.Sequential(layers, name="encoder")
-        
-    def build_decoder(self, kernel_initializer, bias_initializer):
-        """Build decoder network."""
-        layers = []
-        
-        in_channels = self.latent_channels
-        out_channels = self.block_out_channels[-1]
-        
-        # Initial convolution
-        layers.append(
-            tf.keras.layers.Conv2D(
-                out_channels,
-                kernel_size=3,
-                strides=1,
-                padding="same",
-                kernel_initializer=kernel_initializer,
-                bias_initializer=bias_initializer,
-                name="conv_in"
-            )
+        self.conv_out_decoder = layers.Conv2D(
+            out_channels,
+            kernel_size=3,
+            strides=1,
+            padding='same',
+            kernel_initializer=kernel_init,
+            name='conv_out_decoder'
         )
         
-        # Up blocks
-        for i, up_block_type in enumerate(self.up_block_types):
-            input_channel = out_channels
-            out_channels = self.block_out_channels[-(i + 2)]
-            is_final_block = i == len(self.up_block_types) - 1
-            
-            up_block = []
-            
-            # Add layers
-            for _ in range(self.layers_per_block):
-                up_block.append(
-                    tf.keras.layers.Conv2DTranspose(
-                        out_channels,
-                        kernel_size=3,
-                        strides=2 if not is_final_block else 1,
-                        padding="same",
-                        kernel_initializer=kernel_initializer,
-                        bias_initializer=bias_initializer
-                    )
-                )
-                up_block.append(tf.keras.layers.Activation(self.act_fn))
-                
-            layers.extend(up_block)
-            
-        # Final convolution
-        layers.append(
-            tf.keras.layers.Conv2D(
-                self.out_channels,
-                kernel_size=3,
-                strides=1,
-                padding="same",
-                kernel_initializer=kernel_initializer,
-                bias_initializer=bias_initializer,
-                name="conv_out"
-            )
-        )
+    def _make_encoder_block(
+        self,
+        block_type: str,
+        input_channel: int,
+        output_channel: int,
+        kernel_init,
+        name: str
+    ) -> tf.keras.Sequential:
+        """Create encoder block."""
+        block = tf.keras.Sequential(name=name)
         
-        return tf.keras.Sequential(layers, name="decoder")
-    
-    def encode(self, x: tf.Tensor, return_dict: bool = True) -> tf.Tensor:
-        """Encode input tensor to latent space."""
-        h = self.encoder(x)
-        moments = tf.keras.layers.Conv2D(
-            2 * self.latent_channels, 1, padding="same", name="quant_conv"
-        )(h)
-        mean, logvar = tf.split(moments, 2, axis=-1)
+        # Add residual connection
+        block.add(layers.Conv2D(
+            output_channel,
+            kernel_size=3,
+            strides=2,
+            padding='same',
+            kernel_initializer=kernel_init
+        ))
+        block.add(layers.LayerNormalization(epsilon=1e-5))
+        block.add(layers.Activation('swish'))
         
-        # Sample from latent distribution
-        std = tf.exp(0.5 * logvar)
-        latents = mean + std * tf.random.normal(tf.shape(mean))
-        latents = latents * self.scaling_factor
+        return block
+        
+    def _make_decoder_block(
+        self,
+        block_type: str,
+        input_channel: int,
+        output_channel: int,
+        kernel_init,
+        name: str
+    ) -> tf.keras.Sequential:
+        """Create decoder block."""
+        block = tf.keras.Sequential(name=name)
+        
+        # Add upsampling
+        block.add(layers.UpSampling2D(size=(2, 2), interpolation='nearest'))
+        block.add(layers.Conv2D(
+            output_channel,
+            kernel_size=3,
+            strides=1,
+            padding='same',
+            kernel_initializer=kernel_init
+        ))
+        block.add(layers.LayerNormalization(epsilon=1e-5))
+        block.add(layers.Activation('swish'))
+        
+        return block
+        
+    def encode(self, x: tf.Tensor, return_dict: bool = True) -> Dict[str, tf.Tensor]:
+        """Encode input."""
+        h = self.conv_in(x)
+        
+        # Apply encoder blocks
+        for block in self.encoder_blocks:
+            h = block(h)
+            
+        h = self.conv_norm_out(h)
+        h = self.conv_act(h)
+        h = self.conv_out(h)
+        
+        mean, logvar = tf.split(h, 2, axis=-1)
+        logvar = tf.clip_by_value(logvar, -30.0, 20.0)
+        
+        if return_dict:
+            return {"mean": mean, "logvar": logvar}
+        return mean, logvar
+        
+    def decode(self, z: tf.Tensor, return_dict: bool = True) -> tf.Tensor:
+        """Decode latent."""
+        h = z
+        
+        # Apply decoder blocks
+        for block in self.decoder_blocks:
+            h = block(h)
+            
+        h = self.conv_norm_out_decoder(h)
+        h = self.conv_act_decoder(h)
+        h = self.conv_out_decoder(h)
+        
+        if return_dict:
+            return {"sample": h}
+        return h
+        
+    def call(
+        self,
+        inputs: tf.Tensor,
+        sample_posterior: bool = True,
+        return_dict: bool = True,
+        training: bool = False
+    ) -> Dict[str, tf.Tensor]:
+        """Forward pass."""
+        posterior = self.encode(inputs, return_dict=True)
+        
+        if sample_posterior:
+            # Reparameterization trick
+            noise = tf.random.normal(tf.shape(posterior["mean"]))
+            latents = posterior["mean"] + tf.exp(0.5 * posterior["logvar"]) * noise
+        else:
+            latents = posterior["mean"]
+            
+        decoded = self.decode(latents, return_dict=True)
         
         if return_dict:
             return {
-                "latent_dist": {"mean": mean, "std": std},
-                "latents": latents
+                "sample": decoded["sample"],
+                "mean": posterior["mean"],
+                "logvar": posterior["logvar"]
             }
-        return latents
-    
-    def decode(self, z: tf.Tensor, return_dict: bool = False) -> tf.Tensor:
-        """Decode latent tensor to image space."""
-        z = z / self.scaling_factor
-        z = tf.keras.layers.Conv2D(
-            self.latent_channels, 1, padding="same", name="post_quant_conv"
-        )(z)
-        dec = self.decoder(z)
+        return decoded["sample"]
         
-        if return_dict:
-            return {"sample": dec}
-        return dec
-    
-    def call(self, x: tf.Tensor, training: bool = True) -> Dict[str, tf.Tensor]:
-        """Forward pass."""
-        latents = self.encode(x)["latents"]
-        dec = self.decode(latents)
-        return {"sample": dec, "latents": latents}
-    
+    @tf.function
+    def encode_to_latents(self, inputs: tf.Tensor) -> tf.Tensor:
+        """Encode images to latent space."""
+        posterior = self.encode(inputs, return_dict=True)
+        latents = posterior["mean"]
+        return latents * self.scaling_factor
+        
+    @tf.function
+    def decode_from_latents(self, latents: tf.Tensor) -> tf.Tensor:
+        """Decode images from latent space."""
+        latents = latents / self.scaling_factor
+        decoded = self.decode(latents, return_dict=True)
+        return decoded["sample"]
+        
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_path: str,
+        pretrained_model_name_or_path: str,
         **kwargs
     ) -> "AutoencoderKL":
-        """Load pretrained model.
-        
-        Args:
-            pretrained_model_path: Path to pretrained model
-            **kwargs: Additional arguments to pass to __init__
+        """Load pretrained model."""
+        if not os.path.isdir(pretrained_model_name_or_path):
+            pretrained_model_name_or_path = snapshot_download(
+                pretrained_model_name_or_path,
+                allow_patterns=["*.safetensors", "*.json"]
+            )
             
-        Returns:
-            Loaded model
-        """
-        if not os.path.exists(pretrained_model_path):
-            pretrained_model_path = snapshot_download(pretrained_model_path)
-            
-        # Load config
-        config_path = os.path.join(pretrained_model_path, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
+        config_file = os.path.join(pretrained_model_name_or_path, "config.json")
+        if os.path.isfile(config_file):
+            with open(config_file) as f:
                 config = json.load(f)
         else:
             config = {}
             
-        # Update config with kwargs
         config.update(kwargs)
-        
-        # Create model
-        model = cls(config=config)
+        model = cls(**config)
         
         # Load weights
-        weight_files = [f for f in os.listdir(pretrained_model_path) if f.endswith(".safetensors")]
+        weight_files = [f for f in os.listdir(pretrained_model_name_or_path) if f.endswith('.safetensors')]
         if not weight_files:
-            raise ValueError(f"No .safetensors files found in {pretrained_model_path}")
+            raise ValueError(f"No safetensors weights found in {pretrained_model_name_or_path}")
             
-        # Load and convert weights
-        for weight_file in weight_files:
-            weight_path = os.path.join(pretrained_model_path, weight_file)
-            with safe_open(weight_path, framework="pt") as f:
-                for key in f.keys():
-                    tensor = f.get_tensor(key)
-                    tf_tensor = convert_torch_to_tf(tensor)
+        weight_file = os.path.join(pretrained_model_name_or_path, weight_files[0])
+        with safe_open(weight_file, framework="pt") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                tf_tensor = convert_torch_to_tf(tensor, key)
+                
+                # Find corresponding layer and weight
+                layer_name, weight_type = key.rsplit(".", 1)
+                layer = model.get_layer(layer_name)
+                
+                if weight_type == "weight":
+                    layer.kernel.assign(tf_tensor)
+                elif weight_type == "bias":
+                    layer.bias.assign(tf_tensor)
                     
-                    # Find corresponding layer and set weights
-                    layer_name = key.split(".")[0]
-                    if hasattr(model, layer_name):
-                        layer = getattr(model, layer_name)
-                        if isinstance(layer, tf.keras.layers.Layer):
-                            layer.set_weights([tf_tensor])
-                            
         return model
