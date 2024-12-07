@@ -1,11 +1,22 @@
 """OmniGen pipeline for text-to-image generation."""
+from __future__ import annotations
 
 # Standard library imports
 import os
 import time
 import logging
 import inspect
-from typing import List, Union, Optional, Dict, Any, Callable, Tuple
+from typing import (
+    List,
+    Union,
+    Optional,
+    Dict,
+    Any,
+    Callable,
+    Tuple,
+    TypeVar,
+    TYPE_CHECKING,
+)
 
 # Third-party imports
 import tensorflow as tf
@@ -21,6 +32,10 @@ from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
 from .vae import AutoencoderKL
 from .utils import convert_torch_to_tf
+
+# Type definitions
+ImageType = TypeVar('ImageType', bound=Union[Image.Image, List[Image.Image]])
+TensorType = TypeVar('TensorType', bound=tf.Tensor)
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +161,7 @@ class OmniGenPipeline:
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         use_img_guidance: bool = False,
         img_guidance_scale: float = 1.6,
-        guidance_image: Optional[Union[Image.Image, List[Image.Image]]] = None,
+        guidance_image: Optional[ImageType] = None,
     ) -> Union[List[Image.Image], Dict[str, List[Image.Image]]]:
         """Generate images from text prompt.
         

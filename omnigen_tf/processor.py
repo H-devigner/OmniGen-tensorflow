@@ -1,10 +1,20 @@
 """OmniGen processor for text and image inputs."""
+from __future__ import annotations
+
+# Standard library imports
 import os
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any, Callable, TypeVar, TYPE_CHECKING
+import json
+
+# Third-party imports
 import tensorflow as tf
 from PIL import Image
 import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizer
+
+# Type definitions
+ImageType = TypeVar('ImageType', bound=Union[Image.Image, List[Image.Image]])
+TensorType = TypeVar('TensorType', bound=tf.Tensor)
 
 class OmniGenProcessor:
     """Processor for OmniGen inputs."""
@@ -106,7 +116,7 @@ class OmniGenProcessor:
         
     def process_images(
         self,
-        images: Union[Image.Image, List[Image.Image]],
+        images: ImageType,
         height: Optional[int] = None,
         width: Optional[int] = None,
         return_tensors: Optional[str] = None

@@ -6,10 +6,16 @@ setup(
     packages=find_packages(),
     install_requires=[
         "tensorflow>=2.13.0",
-        "transformers",
-        "pillow",
-        "numpy",
-        "huggingface-hub"
+        "tensorflow-hub>=0.14.0",
+        "torch>=2.0.0",
+        "transformers>=4.31.0",
+        "pillow>=9.5.0",
+        "numpy>=1.24.3",
+        "tqdm>=4.65.0",
+        "huggingface-hub>=0.16.4",
+        "safetensors>=0.3.1",
+        "accelerate>=0.21.0",
+        "typing-extensions>=4.5.0"
     ],
     author="H-devigner",
     author_email="",

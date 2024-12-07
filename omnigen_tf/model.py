@@ -1,16 +1,26 @@
 """OmniGen model implementation in TensorFlow."""
+from __future__ import annotations
+
+# Standard library imports
+import os
+import json
+import math
+from typing import Optional, Dict, Any, Union, List, Tuple, Callable, TypeVar, TYPE_CHECKING
+
+# Third-party imports
 import tensorflow as tf
 from tensorflow.keras import layers
 import numpy as np
-import math
-from typing import Optional, Dict, Any, Union, List, Tuple
+import torch
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
-import os
-import json
-import torch
+
+# Local imports
 from .converter import WeightConverter
 from .peft import PeftAdapterMixin
+
+# Type definitions
+TensorType = TypeVar('TensorType', bound=tf.Tensor)
 
 def modulate(x, shift, scale):
     """Modulate layer norm output."""
