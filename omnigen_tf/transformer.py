@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, initializers
 import numpy as np
 from typing import Optional, Dict, Any, List, Union, Tuple
 
@@ -14,10 +14,33 @@ class MultiHeadAttention(layers.Layer):
         self.hidden_size = config.get('hidden_size', 2048)
         self.attention_head_size = self.hidden_size // self.num_attention_heads
         
-        self.query = layers.Dense(self.hidden_size, use_bias=True)
-        self.key = layers.Dense(self.hidden_size, use_bias=True)
-        self.value = layers.Dense(self.hidden_size, use_bias=True)
-        self.out = layers.Dense(self.hidden_size, use_bias=True)
+        # Initialize with truncated normal
+        kernel_init = initializers.TruncatedNormal(stddev=0.02)
+        
+        self.query = layers.Dense(
+            self.hidden_size,
+            use_bias=True,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
+        self.key = layers.Dense(
+            self.hidden_size,
+            use_bias=True,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
+        self.value = layers.Dense(
+            self.hidden_size,
+            use_bias=True,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
+        self.out = layers.Dense(
+            self.hidden_size,
+            use_bias=True,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
         
     def transpose_for_scores(self, x: tf.Tensor) -> tf.Tensor:
         batch_size = tf.shape(x)[0]
@@ -70,8 +93,8 @@ class Phi3Block(layers.Layer):
         super().__init__()
         self.attention = MultiHeadAttention(config)
         self.mlp = tf.keras.Sequential([
-            layers.Dense(config.get('intermediate_size', 8192), activation='gelu'),
-            layers.Dense(config.get('hidden_size', 2048))
+            layers.Dense(config.get('intermediate_size', 8192), activation='gelu', kernel_initializer=initializers.TruncatedNormal(stddev=0.02), bias_initializer='zeros'),
+            layers.Dense(config.get('hidden_size', 2048), kernel_initializer=initializers.TruncatedNormal(stddev=0.02), bias_initializer='zeros')
         ])
         self.input_layernorm = layers.LayerNormalization(epsilon=1e-5)
         self.post_attention_layernorm = layers.LayerNormalization(epsilon=1e-5)

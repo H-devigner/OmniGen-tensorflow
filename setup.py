@@ -15,7 +15,8 @@ setup(
         "huggingface-hub>=0.16.4",
         "safetensors>=0.3.1",
         "accelerate>=0.21.0",
-        "typing-extensions>=4.5.0"
+        "typing-extensions>=4.5.0",
+        "matplotlib>=3.7.0"
     ],
     author="H-devigner",
     author_email="",

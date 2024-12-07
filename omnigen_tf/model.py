@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, Union, List, Tuple, Callable, TypeVar, T
 
 # Third-party imports
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, initializers
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -29,13 +29,13 @@ def modulate(x, shift, scale):
 
 class TimestepEmbedder(layers.Layer):
     """Embeds scalar timesteps into vector representations."""
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, kernel_initializer=None, bias_initializer=None):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True),
+            layers.Dense(hidden_size, use_bias=True, kernel_initializer=kernel_initializer, bias_initializer=bias_initializer),
             layers.Activation('swish'),  # SiLU/Swish activation
-            layers.Dense(hidden_size, use_bias=True)
+            layers.Dense(hidden_size, use_bias=True, kernel_initializer=kernel_initializer, bias_initializer=bias_initializer)
         ])
 
     def timestep_embedding(self, t, dim, max_period=10000):
@@ -58,7 +58,7 @@ class TimestepEmbedder(layers.Layer):
 
 class FinalLayer(layers.Layer):
     """The final layer of OmniGen."""
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, kernel_initializer=None, bias_initializer=None):
         super().__init__()
         self.norm_final = layers.LayerNormalization(
             epsilon=1e-6,
@@ -67,11 +67,13 @@ class FinalLayer(layers.Layer):
         )
         self.linear = layers.Dense(
             patch_size * patch_size * out_channels,
-            use_bias=True
+            use_bias=True,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer
         )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('swish'),
-            layers.Dense(2 * hidden_size, use_bias=True)
+            layers.Dense(2 * hidden_size, use_bias=True, kernel_initializer=kernel_initializer, bias_initializer=bias_initializer)
         ])
 
     def call(self, x, c):
@@ -82,13 +84,15 @@ class FinalLayer(layers.Layer):
 
 class PatchEmbedMR(layers.Layer):
     """2D Image to Patch Embedding."""
-    def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True):
+    def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True, kernel_initializer=None, bias_initializer=None):
         super().__init__()
         self.proj = layers.Conv2D(
             filters=embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
             use_bias=bias,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
             data_format='channels_last'
         )
 
@@ -113,23 +117,35 @@ class OmniGenTF(tf.keras.Model):
         self.pos_embed_max_size = 192
         self.pe_interpolation = 1.0
         
-        # Create embedders
+        # Create embedders with proper initialization
+        kernel_init = initializers.TruncatedNormal(stddev=0.02)
+        
         self.x_embedder = PatchEmbedMR(
             self.patch_size, 
             self.in_channels,
             self.hidden_size,
-            bias=True
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
         )
         self.input_x_embedder = PatchEmbedMR(
             self.patch_size,
             self.in_channels,
             self.hidden_size,
-            bias=True
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
         )
         
         # Time embeddings
-        self.time_token = TimestepEmbedder(self.hidden_size)
-        self.t_embedder = TimestepEmbedder(self.hidden_size)
+        self.time_token = TimestepEmbedder(
+            self.hidden_size,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
+        self.t_embedder = TimestepEmbedder(
+            self.hidden_size,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
         
         # Position embeddings
         pos_embed = get_2d_sincos_pos_embed(
@@ -144,7 +160,9 @@ class OmniGenTF(tf.keras.Model):
         self.final_layer = FinalLayer(
             self.hidden_size,
             self.patch_size,
-            self.out_channels
+            self.out_channels,
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
         )
         
         # Initialize Phi3 transformer
@@ -155,20 +173,27 @@ class OmniGenTF(tf.keras.Model):
         self.initialize_weights()
         
     def initialize_weights(self):
-        """Initialize weights following PyTorch implementation."""
-        def _basic_init(layer):
-            if isinstance(layer, layers.Dense):
-                # Use Glorot (Xavier) uniform initialization
-                layer.kernel_initializer = 'glorot_uniform'
-                if layer.use_bias:
-                    layer.bias_initializer = 'zeros'
-            elif isinstance(layer, layers.Conv2D):
-                layer.kernel_initializer = 'glorot_uniform'
-                if layer.use_bias:
-                    layer.bias_initializer = 'zeros'
-                    
-        self.apply(_basic_init)
-        
+        """Initialize model weights."""
+        # Initialize all layers recursively
+        for layer in self.submodules:
+            self._basic_init(layer)
+            
+    def _basic_init(self, layer):
+        """Basic initialization for a layer."""
+        if isinstance(layer, layers.Dense):
+            layer.kernel_initializer = initializers.TruncatedNormal(stddev=0.02)
+            if layer.use_bias:
+                layer.bias_initializer = 'zeros'
+        elif isinstance(layer, layers.Conv2D):
+            layer.kernel_initializer = initializers.TruncatedNormal(stddev=0.02)
+            if layer.use_bias:
+                layer.bias_initializer = 'zeros'
+        elif isinstance(layer, layers.LayerNormalization):
+            if layer.scale is not None:
+                layer.scale_initializer = 'ones'
+            if layer.offset is not None:
+                layer.offset_initializer = 'zeros'
+
     def unpatchify(self, x, h, w):
         """Reverse patch embedding."""
         # x: [B, L, patch_size**2 * C]
@@ -469,6 +494,36 @@ class OmniGenTF(tf.keras.Model):
             tf_weights[var.name.split(':')[0]]
             for var in self.trainable_variables
         ])
+
+def initialize_layer(layer: tf.keras.layers.Layer):
+    """Initialize layer weights."""
+    if isinstance(layer, layers.Dense):
+        # Initialize kernel with truncated normal
+        layer.kernel.assign(
+            tf.random.truncated_normal(
+                layer.kernel.shape,
+                mean=0.0,
+                stddev=0.02
+            )
+        )
+        if layer.use_bias:
+            layer.bias.assign(tf.zeros_like(layer.bias))
+    elif isinstance(layer, layers.Conv2D):
+        # Initialize kernel with truncated normal
+        layer.kernel.assign(
+            tf.random.truncated_normal(
+                layer.kernel.shape,
+                mean=0.0,
+                stddev=0.02
+            )
+        )
+        if layer.use_bias:
+            layer.bias.assign(tf.zeros_like(layer.bias))
+    elif isinstance(layer, layers.LayerNormalization):
+        if layer.scale is not None:
+            layer.scale.assign(tf.ones_like(layer.scale))
+        if layer.offset is not None:
+            layer.offset.assign(tf.zeros_like(layer.offset))
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
     """Generate 2D sinusoidal positional embeddings."""
