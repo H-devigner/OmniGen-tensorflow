@@ -8,6 +8,8 @@ import json
 import os
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
+import onnx
+from onnx_tf.backend import prepare
 
 from .utils import convert_torch_to_tf
 
@@ -291,4 +293,9 @@ class AutoencoderKL(tf.keras.Model):
                 elif weight_type == "bias":
                     layer.bias.assign(tf_tensor)
                     
+        # Load the ONNX model
+        onnx_model = onnx.load('your_model.onnx')
+        tf_rep = prepare(onnx_model)
+        tf_rep.export_graph('your_model_tf')
+        
         return model

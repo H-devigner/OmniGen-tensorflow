@@ -10,3 +10,5 @@ safetensors>=0.3.1
 accelerate>=0.21.0
 typing-extensions>=4.5.0
 matplotlib>=3.7.0
+onnx
+onnx-tf
