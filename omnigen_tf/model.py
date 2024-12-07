@@ -6,6 +6,7 @@ import os
 import json
 import math
 from typing import Optional, Dict, Any, Union, List, Tuple, Callable, TypeVar, TYPE_CHECKING
+import logging
 
 # Third-party imports
 import tensorflow as tf
@@ -22,6 +23,7 @@ from onnx_tf.backend import prepare
 from .converter import WeightConverter
 from .peft import PeftAdapterMixin
 from .transformer import Phi3TransformerTF
+from .export_model import download_and_convert
 
 # Type definitions
 TensorType = TypeVar('TensorType', bound=tf.Tensor)
@@ -375,23 +377,73 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
         
     @classmethod
     def from_pretrained(
-        cls,
-        pretrained_model_path: str,
-        use_mixed_precision: bool = False,
-        **kwargs
-    ) -> "OmniGenTF":
-        """Load pretrained model."""
-        try:
-            # Load ONNX model
-            onnx_model = onnx.load(pretrained_model_path)
-            tf_rep = prepare(onnx_model)
+            cls,
+            pretrained_model_path: str,
+            use_mixed_precision: bool = False,
+            **kwargs
+        ):
+        """Load pretrained model.
+        
+        Args:
+            pretrained_model_path: Path to pretrained model or model identifier from huggingface.co
+            use_mixed_precision: Whether to use mixed precision
+            **kwargs: Additional arguments to pass to the model
             
-            # Return the TensorFlow representation
-            return tf_rep
+        Returns:
+            OmniGenTF: Loaded model
+        """
+        # Try to load as ONNX model first
+        try:
+            # Download and convert ONNX model
+            tf_model_path = download_and_convert(model_name=pretrained_model_path)
+            
+            # Load the converted TensorFlow model
+            model = tf.saved_model.load(tf_model_path)
+            return model
             
         except Exception as e:
-            raise ValueError(f"Error loading pretrained model: {str(e)}")
+            logging.warning(f"Failed to load ONNX model, falling back to weight conversion: {e}")
             
+            # Fall back to original weight conversion method
+            if os.path.isdir(pretrained_model_path):
+                config_path = os.path.join(pretrained_model_path, "config.json")
+            else:
+                cache_dir = snapshot_download(pretrained_model_path)
+                config_path = os.path.join(cache_dir, "config.json")
+
+            with open(config_path) as f:
+                config = json.load(f)
+
+            model = cls(config, **kwargs)
+
+            # Set mixed precision if requested
+            if use_mixed_precision:
+                policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                tf.keras.mixed_precision.set_global_policy(policy)
+
+            # Load weights
+            try:
+                if os.path.isdir(pretrained_model_path):
+                    safetensors_path = os.path.join(pretrained_model_path, "model.safetensors")
+                    pytorch_path = os.path.join(pretrained_model_path, "pytorch_model.bin")
+                else:
+                    cache_dir = snapshot_download(pretrained_model_path)
+                    safetensors_path = os.path.join(cache_dir, "model.safetensors")
+                    pytorch_path = os.path.join(cache_dir, "pytorch_model.bin")
+
+                if os.path.exists(safetensors_path):
+                    state_dict = load_file(safetensors_path)
+                else:
+                    state_dict = torch.load(pytorch_path)
+
+                converter = WeightConverter(state_dict)
+                converter.convert_weights(model)
+
+            except Exception as e:
+                raise ValueError(f"Error loading weights: {e}")
+
+            return model
+
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
     """Generate 2D sinusoidal positional embeddings."""
     if isinstance(grid_size, int):
