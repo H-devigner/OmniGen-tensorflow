@@ -18,6 +18,7 @@ from huggingface_hub import snapshot_download
 # Local imports
 from .converter import WeightConverter
 from .peft import PeftAdapterMixin
+from .transformer import Phi3TransformerTF
 
 # Type definitions
 TensorType = TypeVar('TensorType', bound=tf.Tensor)
