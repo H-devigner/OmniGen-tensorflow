@@ -398,6 +398,7 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
                     "attention_probs_dropout_prob": 0.1
                 }
             
+            print(f"Loading model with configuration: {config}")
             # Initialize model
             model = cls(config, **kwargs)
             
