@@ -280,7 +280,7 @@ class AutoencoderKL(tf.keras.Model):
         with safe_open(weight_file, framework="pt") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
-                tf_tensor = convert_torch_to_tf(tensor)
+                tf_tensor = convert_torch_to_tf(tensor.detach().cpu().numpy())
                 
                 # Find corresponding layer and weight
                 layer_name, weight_type = key.rsplit(".", 1)
