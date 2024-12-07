@@ -1,141 +1,101 @@
 """Weight converter for PyTorch to TensorFlow."""
-import os
-import tensorflow as tf
+from __future__ import annotations
+
 import numpy as np
+import tensorflow as tf
 import torch
-from typing import Dict, Any, Optional
-from huggingface_hub import snapshot_download
-from safetensors.torch import load_file, save_file
+from typing import Dict, Any, Union, List
 
 class WeightConverter:
     """Converts PyTorch weights to TensorFlow format."""
     
     def __init__(self):
-        pass
-        
-    def download_pytorch_weights(self, model_name):
-        """Download PyTorch weights from HuggingFace hub."""
-        if not os.path.exists(model_name):
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            model_path = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
-            )
-        else:
-            model_path = model_name
-            
-        # Load safetensors weights
-        if os.path.exists(os.path.join(model_path, 'model.safetensors')):
-            print("Loading safetensors weights...")
-            weights = load_file(os.path.join(model_path, 'model.safetensors'))
-        else:
-            raise ValueError(f"No model weights found in {model_path}")
-            
-        # Load config
-        config = self._load_config(model_path)
-        return weights, config
-        
-    def _load_config(self, model_path):
-        """Load model configuration."""
-        config_path = os.path.join(model_path, 'config.json')
-        if not os.path.exists(config_path):
-            raise ValueError(f"No config.json found in {model_path}")
-            
-        import json
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        return config
-        
-    def convert_weights(self, pytorch_weights, layer_mapping):
-        """Convert PyTorch weights to TensorFlow format."""
-        tf_weights = {}
-        
-        for pt_name, tf_name in layer_mapping.items():
-            if pt_name in pytorch_weights:
-                weight = pytorch_weights[pt_name].numpy()
-                
-                # Handle different layer types
-                if 'conv' in tf_name.lower():
-                    # Convert NCHW to NHWC format for conv layers
-                    weight = np.transpose(weight, (2, 3, 1, 0))
-                elif 'dense' in tf_name.lower() or 'linear' in tf_name.lower():
-                    # Transpose weights for dense/linear layers
-                    if len(weight.shape) == 2:
-                        weight = weight.transpose()
-                        
-                tf_weights[tf_name] = weight
-                
-        return tf_weights
-    
-    def convert_torch_to_tf(self, state_dict):
-        """Convert PyTorch state dict to TensorFlow weights.
-        
-        Args:
-            state_dict: PyTorch state dictionary
-            
-        Returns:
-            List of TensorFlow weight tensors
-        """
-        # Define layer mapping between PyTorch and TensorFlow
-        layer_mapping = {
-            'x_embedder': 'x_embedder/proj',
-            'input_x_embedder': 'input_x_embedder/proj',
-            'time_token': 'time_token',
-            't_embedder': 't_embedder',
-            'pos_embed': 'pos_embed',
-            'final_layer': 'final_layer',
-            'llm': 'llm'
+        self.name_map = {
+            'weight': 'kernel',
+            'running_mean': 'moving_mean',
+            'running_var': 'moving_variance'
         }
-        
+    
+    def _convert_name(self, pt_name: str) -> str:
+        """Convert PyTorch parameter names to TensorFlow names."""
+        tf_name = pt_name
+        for pt_key, tf_key in self.name_map.items():
+            tf_name = tf_name.replace(pt_key, tf_key)
+        return tf_name
+    
+    def _convert_tensor(self, weight_np: np.ndarray, pt_name: str) -> np.ndarray:
+        """Convert tensor based on layer type and shape."""
+        # Skip conversion for 1D tensors (biases, etc.)
+        if len(weight_np.shape) <= 1:
+            return weight_np
+            
+        try:
+            # Handle convolution weights
+            if 'conv' in pt_name.lower() or 'downsample' in pt_name.lower():
+                if len(weight_np.shape) == 4:
+                    # PyTorch: [out_channels, in_channels, height, width]
+                    # TensorFlow: [height, width, in_channels, out_channels]
+                    return np.transpose(weight_np, (2, 3, 1, 0))
+                elif len(weight_np.shape) == 3:
+                    # For 1D convolutions
+                    return np.transpose(weight_np, (2, 1, 0))
+                    
+            # Handle attention/linear layer weights
+            elif any(x in pt_name.lower() for x in ['linear', 'dense', 'attention', 'mlp']):
+                if len(weight_np.shape) == 2:
+                    # PyTorch: [out_features, in_features]
+                    # TensorFlow: [in_features, out_features]
+                    return np.transpose(weight_np, (1, 0))
+                elif len(weight_np.shape) == 3:
+                    # For attention layers with extra dimension
+                    return np.transpose(weight_np, (0, 2, 1))
+                    
+            # Handle batch norm weights
+            elif 'batch' in pt_name.lower() or 'bn' in pt_name.lower():
+                # Keep original shape for batch norm
+                return weight_np
+                
+        except Exception as e:
+            print(f"Warning: Failed to convert weights for {pt_name} with shape {weight_np.shape}: {str(e)}")
+            # Return original weights if conversion fails
+            return weight_np
+            
+        # Default: return original weights if no conversion rule matches
+        return weight_np
+    
+    def convert_torch_to_tf(self, state_dict: Dict[str, Any]) -> List[np.ndarray]:
+        """Convert PyTorch state dict to TensorFlow weights."""
         tf_weights = []
         
-        # Convert each layer's weights
         for pt_name, weight in state_dict.items():
             # Convert to numpy array
-            weight_np = weight.numpy()
+            if isinstance(weight, torch.Tensor):
+                weight_np = weight.detach().cpu().numpy()
+            else:
+                weight_np = np.array(weight)
             
-            # Handle convolution weights
-            if 'proj' in pt_name:
-                # PyTorch conv weights are [out_channels, in_channels, height, width]
-                # TensorFlow expects [height, width, in_channels, out_channels]
-                weight_np = np.transpose(weight_np, (2, 3, 1, 0))
-                
-            # Handle linear layer weights
-            elif 'linear' in pt_name or 'dense' in pt_name:
-                # PyTorch linear weights are [out_features, in_features]
-                # TensorFlow expects [in_features, out_features]
-                weight_np = np.transpose(weight_np)
-                
-            # Handle attention weights
-            elif any(x in pt_name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
-                # Attention weights need special handling
-                if weight_np.ndim == 2:
-                    weight_np = np.transpose(weight_np)
-                    
-            # Handle layer norm weights
-            elif 'norm' in pt_name:
-                # Layer norm weights typically don't need transformation
-                pass
-                
-            # Convert to TensorFlow tensor
-            tf_tensor = tf.convert_to_tensor(weight_np)
-            tf_weights.append(tf_tensor)
+            # Convert tensor format
+            weight_np = self._convert_tensor(weight_np, pt_name)
+            
+            tf_weights.append(weight_np)
             
         return tf_weights
         
-    def save_tf_weights(self, tf_weights, output_path):
-        """Save converted TensorFlow weights."""
-        if not os.path.exists(output_path):
-            os.makedirs(output_path)
+    def convert_tf_to_torch(self, tf_weights: List[np.ndarray], state_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Convert TensorFlow weights back to PyTorch format."""
+        torch_state_dict = {}
         
-        # Save weights in TensorFlow format
-        np.save(os.path.join(output_path, 'tf_weights.npy'), tf_weights)
-        
-    def load_local_weights(self, weights_path: str):
-        """Load weights from local safetensors file."""
-        return load_file(weights_path)
-        
-    def save_weights(self, weights, weights_path: str):
-        """Save weights to local safetensors file."""
-        save_file(weights, weights_path)
+        for (pt_name, orig_tensor), tf_weight in zip(state_dict.items(), tf_weights):
+            # Convert back to PyTorch format
+            if len(tf_weight.shape) == 4:
+                # Convert back from TF to PT conv format
+                weight_np = np.transpose(tf_weight, (3, 2, 0, 1))
+            elif len(tf_weight.shape) == 2:
+                # Convert back from TF to PT linear format
+                weight_np = np.transpose(tf_weight, (1, 0))
+            else:
+                weight_np = tf_weight
+                
+            torch_state_dict[pt_name] = torch.from_numpy(weight_np)
+            
+        return torch_state_dict

@@ -455,106 +455,75 @@ class OmniGenTF(tf.keras.Model):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str, use_mixed_precision: bool = False, **kwargs):
-        """Load pretrained model from path.
-        
-        Args:
-            pretrained_model_path: Path to pretrained model directory
-            use_mixed_precision: Whether to use mixed precision
-            **kwargs: Additional arguments to pass to model initialization
-            
-        Returns:
-            OmniGenTF: Loaded model
-        """
-        # Load config
-        if not os.path.exists(pretrained_model_path):
-            pretrained_model_path = snapshot_download(pretrained_model_path)
-            
-        config_path = os.path.join(pretrained_model_path, "config.json")
-        if not os.path.exists(config_path):
-            raise ValueError(f"Config not found at {config_path}")
-            
-        with open(config_path, "r") as f:
-            config = json.load(f)
-            
-        # Initialize model
-        model = cls(config, **kwargs)
-        
-        # Set mixed precision if requested
-        if use_mixed_precision:
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
-            
-        # Load weights
-        weights_path = os.path.join(pretrained_model_path, "tf_model")
-        if os.path.exists(weights_path):
-            model.load_weights(weights_path)
-        else:
-            # Try loading PyTorch weights and converting
-            pytorch_weights = os.path.join(pretrained_model_path, "pytorch_model.bin")
-            safetensors_weights = os.path.join(pretrained_model_path, "model.safetensors")
-            
-            if os.path.exists(safetensors_weights):
-                # Load from safetensors
-                with safe_open(safetensors_weights, framework="pt") as f:
-                    state_dict = {key: f.get_tensor(key) for key in f.keys()}
-            elif os.path.exists(pytorch_weights):
-                # Load from PyTorch weights
-                state_dict = torch.load(pytorch_weights, map_location="cpu")
+        """Load model from pretrained weights."""
+        try:
+            # Download and load configuration
+            if not os.path.exists(pretrained_model_path):
+                cache_folder = os.getenv('HF_HUB_CACHE')
+                model_path = snapshot_download(
+                    repo_id=pretrained_model_path,
+                    cache_dir=cache_folder,
+                    ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+                )
             else:
-                raise ValueError(f"No weights found at {weights_path}, {pytorch_weights}, or {safetensors_weights}")
+                model_path = pretrained_model_path
+            
+            # Load configuration
+            config_path = os.path.join(model_path, 'config.json')
+            if not os.path.exists(config_path):
+                raise ValueError(f"No config.json found in {model_path}")
                 
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Initialize model
+            model = cls(config, **kwargs)
+            
+            # Load weights
+            weights_path = os.path.join(model_path, 'model.safetensors')
+            if not os.path.exists(weights_path):
+                raise ValueError(f"No model weights found in {model_path}")
+                
+            print("Loading weights...")
+            state_dict = {}
+            with safe_open(weights_path, framework="pt") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+            
             # Convert PyTorch weights to TensorFlow
+            print("Converting weights to TensorFlow format...")
             converter = WeightConverter()
-            tf_weights = converter.convert_torch_to_tf(state_dict)
+            tf_weights = []
+            
+            # Process weights layer by layer
+            for name, param in model.state_dict().items():
+                if name in state_dict:
+                    weight = state_dict[name]
+                    if isinstance(weight, torch.Tensor):
+                        weight = weight.detach().cpu().numpy()
+                    tf_weights.append(converter._convert_tensor(weight, name))
+                else:
+                    print(f"Warning: Weight {name} not found in state dict")
+                    # Initialize missing weights
+                    if 'kernel' in name:
+                        init = tf.keras.initializers.TruncatedNormal(stddev=0.02)
+                    else:
+                        init = tf.keras.initializers.Zeros()
+                    tf_weights.append(init(param.shape).numpy())
             
             # Set weights
             model.set_weights(tf_weights)
             
-            # Save converted weights for future use
-            model.save_weights(weights_path)
-        
-        return model
-        
-    def load_state_dict_from_pytorch(self, state_dict):
-        """Load PyTorch state dict.
-        
-        Args:
-            state_dict: PyTorch state dict
-        """
-        # Map PyTorch parameter names to TF names
-        name_mapping = {
-            "llm.": "transformer.",
-            "input_x_embedder": "input_embedder",
-            "x_embedder": "latent_embedder",
-            "final_layer": "output_projection",
-            ".weight": "/kernel",
-            ".bias": "/bias",
-            "layernorm": "layer_norm"
-        }
-        
-        # Convert and load weights
-        tf_weights = {}
-        for pt_name, pt_param in state_dict.items():
-            tf_name = pt_name
-            for pt_pattern, tf_pattern in name_mapping.items():
-                tf_name = tf_name.replace(pt_pattern, tf_pattern)
-                
-            # Convert parameter
-            param_value = pt_param.numpy()
+            # Enable mixed precision if requested
+            if use_mixed_precision:
+                policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                tf.keras.mixed_precision.set_global_policy(policy)
             
-            # Handle kernel transformations
-            if "kernel" in tf_name:
-                if len(param_value.shape) == 4:  # Conv kernels
-                    param_value = np.transpose(param_value, (2, 3, 1, 0))
-                elif len(param_value.shape) == 2:  # Linear kernels
-                    param_value = np.transpose(param_value)
-                    
-            tf_weights[tf_name] = param_value
+            return model
             
-        # Set weights
-        self.set_weights([
-            tf_weights[var.name.split(':')[0]]
-            for var in self.trainable_variables
-        ])
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            raise
 
 def initialize_layer(layer: tf.keras.layers.Layer):
     """Initialize layer weights."""
