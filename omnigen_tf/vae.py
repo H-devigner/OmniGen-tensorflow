@@ -284,7 +284,7 @@ class AutoencoderKL(tf.keras.Model):
                 
                 # Find corresponding layer and weight
                 layer_name, weight_type = key.rsplit(".", 1)
-                layer = model.get_layer(layer_name.split('.')[0])
+                layer = model.layers[-1].adaLN_modulation[1]
                 
                 if weight_type == "weight":
                     layer.kernel.assign(tf_tensor)
