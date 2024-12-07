@@ -1,5 +1,8 @@
 """VAE model for OmniGen."""
+from __future__ import annotations
+
 import tensorflow as tf
+from tensorflow.keras import layers, initializers
 from typing import Optional, Tuple, Dict, Any
 import json
 import os
@@ -21,100 +24,105 @@ class AutoencoderKL(tf.keras.Model):
         layers_per_block: int = 1,
         act_fn: str = "silu",
         latent_channels: int = 4,
+        sample_size: int = 32,
         scaling_factor: float = 0.18215,
-        config: Optional[Dict[str, Any]] = None
+        **kwargs
     ):
-        """Initialize VAE model.
-        
-        Args:
-            in_channels: Number of input channels
-            out_channels: Number of output channels
-            down_block_types: Types of down blocks
-            up_block_types: Types of up blocks
-            block_out_channels: Number of output channels for each block
-            layers_per_block: Number of layers per block
-            act_fn: Activation function
-            latent_channels: Number of latent channels
-            scaling_factor: Scaling factor for latents
-            config: Model configuration
-        """
         super().__init__()
-        
-        self.config = config or {
-            "in_channels": in_channels,
-            "out_channels": out_channels,
-            "down_block_types": down_block_types,
-            "up_block_types": up_block_types,
-            "block_out_channels": block_out_channels,
-            "layers_per_block": layers_per_block,
-            "act_fn": act_fn,
-            "latent_channels": latent_channels,
-            "scaling_factor": scaling_factor
-        }
-        
-        # Build encoder
-        self.encoder = self._build_encoder()
-        
-        # Build decoder
-        self.decoder = self._build_decoder()
-        
-        # Build bottleneck
-        self.quant_conv = tf.keras.layers.Conv2D(
-            2 * latent_channels, 1, padding="same", name="quant_conv"
-        )
-        self.post_quant_conv = tf.keras.layers.Conv2D(
-            latent_channels, 1, padding="same", name="post_quant_conv"
-        )
-        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.down_block_types = down_block_types
+        self.up_block_types = up_block_types
+        self.block_out_channels = block_out_channels
+        self.layers_per_block = layers_per_block
+        self.latent_channels = latent_channels
+        self.sample_size = sample_size
         self.scaling_factor = scaling_factor
         
-    def _build_encoder(self) -> tf.keras.Sequential:
+        # Initialize with truncated normal
+        kernel_init = initializers.TruncatedNormal(stddev=0.02)
+        
+        # Build encoder
+        self.encoder = self.build_encoder(
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
+        
+        # Build decoder
+        self.decoder = self.build_decoder(
+            kernel_initializer=kernel_init,
+            bias_initializer='zeros'
+        )
+        
+        # Build the model
+        self.build((None, None, None, in_channels))
+        
+    def build(self, input_shape):
+        """Build the model and initialize weights."""
+        super().build(input_shape)
+        
+        # Initialize all layers
+        for layer in self.layers:
+            if hasattr(layer, 'kernel_initializer'):
+                layer.kernel.assign(
+                    layer.kernel_initializer(layer.kernel.shape)
+                )
+            if hasattr(layer, 'bias_initializer') and layer.use_bias:
+                layer.bias.assign(
+                    layer.bias_initializer(layer.bias.shape)
+                )
+
+    def build_encoder(self, kernel_initializer, bias_initializer):
         """Build encoder network."""
         layers = []
-        in_channels = self.config["in_channels"]
+        in_channels = self.in_channels
         
         # Initial convolution
         layers.append(
             tf.keras.layers.Conv2D(
-                self.config["block_out_channels"][0],
+                self.block_out_channels[0],
                 kernel_size=3,
                 strides=1,
                 padding="same",
+                kernel_initializer=kernel_initializer,
+                bias_initializer=bias_initializer,
                 name="conv_in"
             )
         )
         
         # Down blocks
-        output_channel = self.config["block_out_channels"][0]
-        for i, down_block_type in enumerate(self.config["down_block_types"]):
+        output_channel = self.block_out_channels[0]
+        for i, down_block_type in enumerate(self.down_block_types):
             input_channel = output_channel
-            output_channel = self.config["block_out_channels"][min(i + 1, len(self.config["block_out_channels"]) - 1)]
-            is_final_block = i == len(self.config["down_block_types"]) - 1
+            output_channel = self.block_out_channels[min(i + 1, len(self.block_out_channels) - 1)]
+            is_final_block = i == len(self.down_block_types) - 1
             
             down_block = []
             
             # Add layers
-            for _ in range(self.config["layers_per_block"]):
+            for _ in range(self.layers_per_block):
                 down_block.append(
                     tf.keras.layers.Conv2D(
                         output_channel,
                         kernel_size=3,
                         strides=2 if not is_final_block else 1,
-                        padding="same"
+                        padding="same",
+                        kernel_initializer=kernel_initializer,
+                        bias_initializer=bias_initializer
                     )
                 )
-                down_block.append(tf.keras.layers.Activation(self.config["act_fn"]))
+                down_block.append(tf.keras.layers.Activation(self.act_fn))
                 
             layers.extend(down_block)
             
         return tf.keras.Sequential(layers, name="encoder")
         
-    def _build_decoder(self) -> tf.keras.Sequential:
+    def build_decoder(self, kernel_initializer, bias_initializer):
         """Build decoder network."""
         layers = []
         
-        in_channels = self.config["latent_channels"]
-        out_channels = self.config["block_out_channels"][-1]
+        in_channels = self.latent_channels
+        out_channels = self.block_out_channels[-1]
         
         # Initial convolution
         layers.append(
@@ -123,39 +131,45 @@ class AutoencoderKL(tf.keras.Model):
                 kernel_size=3,
                 strides=1,
                 padding="same",
+                kernel_initializer=kernel_initializer,
+                bias_initializer=bias_initializer,
                 name="conv_in"
             )
         )
         
         # Up blocks
-        for i, up_block_type in enumerate(self.config["up_block_types"]):
+        for i, up_block_type in enumerate(self.up_block_types):
             input_channel = out_channels
-            out_channels = self.config["block_out_channels"][-(i + 2)]
-            is_final_block = i == len(self.config["up_block_types"]) - 1
+            out_channels = self.block_out_channels[-(i + 2)]
+            is_final_block = i == len(self.up_block_types) - 1
             
             up_block = []
             
             # Add layers
-            for _ in range(self.config["layers_per_block"]):
+            for _ in range(self.layers_per_block):
                 up_block.append(
                     tf.keras.layers.Conv2DTranspose(
                         out_channels,
                         kernel_size=3,
                         strides=2 if not is_final_block else 1,
-                        padding="same"
+                        padding="same",
+                        kernel_initializer=kernel_initializer,
+                        bias_initializer=bias_initializer
                     )
                 )
-                up_block.append(tf.keras.layers.Activation(self.config["act_fn"]))
+                up_block.append(tf.keras.layers.Activation(self.act_fn))
                 
             layers.extend(up_block)
             
         # Final convolution
         layers.append(
             tf.keras.layers.Conv2D(
-                self.config["out_channels"],
+                self.out_channels,
                 kernel_size=3,
                 strides=1,
                 padding="same",
+                kernel_initializer=kernel_initializer,
+                bias_initializer=bias_initializer,
                 name="conv_out"
             )
         )
@@ -165,7 +179,9 @@ class AutoencoderKL(tf.keras.Model):
     def encode(self, x: tf.Tensor, return_dict: bool = True) -> tf.Tensor:
         """Encode input tensor to latent space."""
         h = self.encoder(x)
-        moments = self.quant_conv(h)
+        moments = tf.keras.layers.Conv2D(
+            2 * self.latent_channels, 1, padding="same", name="quant_conv"
+        )(h)
         mean, logvar = tf.split(moments, 2, axis=-1)
         
         # Sample from latent distribution
@@ -183,7 +199,9 @@ class AutoencoderKL(tf.keras.Model):
     def decode(self, z: tf.Tensor, return_dict: bool = False) -> tf.Tensor:
         """Decode latent tensor to image space."""
         z = z / self.scaling_factor
-        z = self.post_quant_conv(z)
+        z = tf.keras.layers.Conv2D(
+            self.latent_channels, 1, padding="same", name="post_quant_conv"
+        )(z)
         dec = self.decoder(z)
         
         if return_dict:

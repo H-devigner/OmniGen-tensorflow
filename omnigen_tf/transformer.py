@@ -42,6 +42,21 @@ class MultiHeadAttention(layers.Layer):
             bias_initializer='zeros'
         )
         
+    def build(self, input_shape):
+        """Build the layer."""
+        super().build(input_shape)
+        
+        # Initialize weights
+        for layer in [self.query, self.key, self.value, self.out]:
+            if hasattr(layer, 'kernel_initializer'):
+                layer.kernel.assign(
+                    layer.kernel_initializer(layer.kernel.shape)
+                )
+            if hasattr(layer, 'bias_initializer') and layer.use_bias:
+                layer.bias.assign(
+                    layer.bias_initializer(layer.bias.shape)
+                )
+
     def transpose_for_scores(self, x: tf.Tensor) -> tf.Tensor:
         batch_size = tf.shape(x)[0]
         seq_length = tf.shape(x)[1]

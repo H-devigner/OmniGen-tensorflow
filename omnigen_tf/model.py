@@ -29,14 +29,47 @@ def modulate(x, shift, scale):
 
 class TimestepEmbedder(layers.Layer):
     """Embeds scalar timesteps into vector representations."""
-    def __init__(self, hidden_size, frequency_embedding_size=256, kernel_initializer=None, bias_initializer=None):
+    def __init__(
+        self,
+        hidden_size,
+        frequency_embedding_size=256,
+        kernel_initializer=None,
+        bias_initializer=None
+    ):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
+        
+        # Initialize with proper initializers
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, kernel_initializer=kernel_initializer, bias_initializer=bias_initializer),
-            layers.Activation('swish'),  # SiLU/Swish activation
-            layers.Dense(hidden_size, use_bias=True, kernel_initializer=kernel_initializer, bias_initializer=bias_initializer)
+            layers.Dense(
+                hidden_size,
+                use_bias=True,
+                kernel_initializer=kernel_initializer,
+                bias_initializer=bias_initializer
+            ),
+            layers.Activation('swish'),
+            layers.Dense(
+                hidden_size,
+                use_bias=True,
+                kernel_initializer=kernel_initializer,
+                bias_initializer=bias_initializer
+            )
         ])
+        
+    def build(self, input_shape):
+        """Build the layer."""
+        super().build(input_shape)
+        
+        # Initialize weights
+        for layer in self.mlp.layers:
+            if hasattr(layer, 'kernel_initializer'):
+                layer.kernel.assign(
+                    layer.kernel_initializer(layer.kernel.shape)
+                )
+            if hasattr(layer, 'bias_initializer') and layer.use_bias:
+                layer.bias.assign(
+                    layer.bias_initializer(layer.bias.shape)
+                )
 
     def timestep_embedding(self, t, dim, max_period=10000):
         """Create sinusoidal timestep embeddings."""
@@ -169,9 +202,37 @@ class OmniGenTF(tf.keras.Model):
         self.llm = Phi3TransformerTF(config)
         self.llm.use_cache = False
         
-        # Initialize weights
-        self.initialize_weights()
+        # Build the model to initialize weights
+        self.build((None, None, None, self.in_channels))
         
+    def build(self, input_shape):
+        """Build the model and initialize weights."""
+        super().build(input_shape)
+        
+        # Initialize all layers
+        for layer in self.layers:
+            if hasattr(layer, 'kernel_initializer'):
+                layer.kernel.assign(
+                    layer.kernel_initializer(layer.kernel.shape)
+                )
+            if hasattr(layer, 'bias_initializer') and layer.use_bias:
+                layer.bias.assign(
+                    layer.bias_initializer(layer.bias.shape)
+                )
+                
+    def get_config(self):
+        """Get model configuration."""
+        config = super().get_config()
+        config.update({
+            'hidden_size': self.hidden_size,
+            'patch_size': self.patch_size,
+            'in_channels': self.in_channels,
+            'out_channels': self.out_channels,
+            'pos_embed_max_size': self.pos_embed_max_size,
+            'pe_interpolation': self.pe_interpolation,
+        })
+        return config
+
     def initialize_weights(self):
         """Initialize model weights."""
         # Initialize all layers recursively
