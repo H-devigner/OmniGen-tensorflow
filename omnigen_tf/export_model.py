@@ -4,22 +4,68 @@ import sys
 from huggingface_hub import snapshot_download
 import logging
 from pathlib import Path
+import shutil
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def setup_paths():
-    """Setup paths for Kaggle environment"""
-    # Get the current working directory
-    current_dir = Path.cwd()
+def setup_kaggle_environment():
+    """Setup the Kaggle environment and required paths"""
+    try:
+        current_dir = Path.cwd()
+        logger.info(f"Current working directory: {current_dir}")
+        
+        # Check if we're in the correct directory structure
+        if "OmniGen-tensorflow" in str(current_dir):
+            base_dir = current_dir.parent
+        else:
+            base_dir = current_dir
+            
+        # Add base directory to Python path
+        if str(base_dir) not in sys.path:
+            sys.path.append(str(base_dir))
+            logger.info(f"Added {base_dir} to Python path")
+            
+        # Create cache directory
+        cache_dir = current_dir / "model_cache"
+        cache_dir.mkdir(exist_ok=True)
+        
+        # Verify OmniGen module is available
+        omnigen_dir = base_dir / "OmniGen"
+        if not omnigen_dir.exists():
+            raise ImportError(f"OmniGen directory not found at {omnigen_dir}")
+            
+        if str(omnigen_dir) not in sys.path:
+            sys.path.append(str(omnigen_dir))
+            logger.info(f"Added {omnigen_dir} to Python path")
+            
+        return current_dir, cache_dir
+        
+    except Exception as e:
+        logger.error(f"Error setting up Kaggle environment: {e}")
+        raise
+
+def verify_dependencies():
+    """Verify all required dependencies are installed"""
+    required_packages = [
+        'torch',
+        'onnx',
+        'onnx-tf',
+        'tensorflow',
+        'huggingface_hub',
+        'transformers'
+    ]
     
-    # Add the OmniGen directory to sys.path
-    omnigen_dir = current_dir.parent if "OmniGen-tensorflow" in str(current_dir) else current_dir
-    if str(omnigen_dir) not in sys.path:
-        sys.path.append(str(omnigen_dir))
+    missing_packages = []
+    for package in required_packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            missing_packages.append(package)
     
-    return current_dir
+    if missing_packages:
+        raise ImportError(f"Missing required packages: {', '.join(missing_packages)}")
 
 def export_model_to_onnx(model_name="Shitao/omnigen-v1", output_dir=None):
     """
@@ -30,23 +76,34 @@ def export_model_to_onnx(model_name="Shitao/omnigen-v1", output_dir=None):
         output_dir (str, optional): Directory to save the ONNX model. If None, uses current directory.
     """
     try:
-        # Setup paths
-        current_dir = setup_paths()
+        # Verify dependencies first
+        verify_dependencies()
         
-        # Import OmniGen modules after path setup
-        from OmniGen.model import OmniGen
-        from OmniGen.transformer import Phi3Config
+        # Setup Kaggle environment
+        current_dir, cache_dir = setup_kaggle_environment()
+        
+        # Now try to import OmniGen modules
+        try:
+            from OmniGen.model import OmniGen
+            from OmniGen.transformer import Phi3Config
+        except ImportError as e:
+            logger.error(f"Failed to import OmniGen modules: {e}")
+            logger.info("Checking Python path:")
+            for path in sys.path:
+                logger.info(f"  {path}")
+            raise
         
         # Set output directory
         if output_dir is None:
             output_dir = current_dir
-        output_path = os.path.join(output_dir, "omnigen_model.onnx")
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        output_path = output_dir / "omnigen_model.onnx"
         
         # Download the model
         logger.info(f"Downloading model from {model_name}...")
-        cache_dir = os.path.join(current_dir, "model_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        model_path = snapshot_download(model_name, cache_dir=cache_dir)
+        model_path = snapshot_download(model_name, cache_dir=str(cache_dir))
+        logger.info(f"Model downloaded to {model_path}")
         
         # Initialize model configuration
         config = Phi3Config(
@@ -70,7 +127,7 @@ def export_model_to_onnx(model_name="Shitao/omnigen-v1", output_dir=None):
         channels = 4
         height = 64
         width = 64
-        seq_length = 77  # Standard sequence length for text tokens
+        seq_length = 77
         
         dummy_inputs = {
             'x': torch.randn(batch_size, channels, height, width),
@@ -87,7 +144,7 @@ def export_model_to_onnx(model_name="Shitao/omnigen-v1", output_dir=None):
         torch.onnx.export(
             model,
             tuple(dummy_inputs.values()),
-            output_path,
+            str(output_path),
             input_names=list(dummy_inputs.keys()),
             output_names=['output'],
             dynamic_axes={
@@ -101,15 +158,23 @@ def export_model_to_onnx(model_name="Shitao/omnigen-v1", output_dir=None):
             opset_version=12,
             export_params=True,
             do_constant_folding=True,
-            verbose=False
+            verbose=True  # Enable verbose output for debugging
         )
-        logger.info(f"Model exported successfully to {output_path}!")
-        return output_path
+        
+        # Verify the exported model
+        import onnx
+        onnx_model = onnx.load(str(output_path))
+        onnx.checker.check_model(onnx_model)
+        logger.info("ONNX model verification passed!")
+        
+        return str(output_path)
         
     except Exception as e:
         logger.error(f"Error during model export: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    # Example usage in Kaggle
+    # For Kaggle notebook, you should run this after setting up the environment:
+    # !git clone https://github.com/Shitao/OmniGen.git
+    # !pip install onnx onnx-tf
     export_model_to_onnx()
