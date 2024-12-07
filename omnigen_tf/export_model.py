@@ -12,50 +12,88 @@ from safetensors.torch import load_file
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class TFOmniGen(tf.keras.Model):
+    """TensorFlow implementation of OmniGen"""
+    def __init__(self, state_dict):
+        super().__init__()
+        self.layers_dict = {}
+        self.build_model_layers(state_dict)
+        
+    def build_model_layers(self, state_dict):
+        """Build model layers from state dict"""
+        # Track layer dimensions for proper initialization
+        layer_dims = {}
+        
+        # First pass: collect layer dimensions
+        for key, value in state_dict.items():
+            if 'weight' in key:
+                base_name = key.replace('.weight', '')
+                layer_dims[base_name] = value.shape
+        
+        # Second pass: create layers
+        for base_name, shape in layer_dims.items():
+            if len(shape) == 2:  # Linear layer
+                self.layers_dict[base_name] = tf.keras.layers.Dense(
+                    units=shape[0],
+                    use_bias=False,
+                    name=base_name
+                )
+            elif len(shape) == 4:  # Conv layer
+                self.layers_dict[base_name] = tf.keras.layers.Conv2D(
+                    filters=shape[0],
+                    kernel_size=shape[2:],
+                    use_bias=False,
+                    name=base_name
+                )
+    
+    def build(self, input_shape):
+        """Build the model (required by Keras)"""
+        # Create a dummy input to build all layers
+        dummy_inputs = {
+            'x': tf.keras.Input(shape=(4, 64, 64), dtype=tf.float32),
+            'timestep': tf.keras.Input(shape=(), dtype=tf.int32),
+            'input_ids': tf.keras.Input(shape=(77,), dtype=tf.int32),
+            'attention_mask': tf.keras.Input(shape=(77,), dtype=tf.int32),
+            'position_ids': tf.keras.Input(shape=(77,), dtype=tf.int32)
+        }
+        self.call(dummy_inputs)
+    
+    @tf.function
+    def call(self, inputs):
+        """Forward pass"""
+        x = inputs['x']
+        timestep = inputs['timestep']
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        position_ids = inputs['position_ids']
+        
+        # Placeholder implementation
+        # TODO: Implement actual forward pass logic
+        return x
+
 def convert_to_tensorflow(state_dict, output_path):
     """Convert PyTorch state dict to TensorFlow format"""
     logger.info("Converting model to TensorFlow...")
     
-    class TFWrapper(tf.keras.Model):
-        def __init__(self):
-            super().__init__()
-            # Initialize layers based on state dict structure
-            self.build_layers(state_dict)
-            
-        def build_layers(self, state_dict):
-            # Map PyTorch state dict to TensorFlow layers
-            for key, value in state_dict.items():
-                if 'weight' in key:
-                    layer_name = key.replace('.weight', '')
-                    shape = value.shape
-                    if len(shape) == 2:  # Linear layer
-                        setattr(self, layer_name, tf.keras.layers.Dense(
-                            units=shape[0],
-                            input_shape=(shape[1],),
-                            use_bias=False
-                        ))
-                    elif len(shape) == 4:  # Conv layer
-                        setattr(self, layer_name, tf.keras.layers.Conv2D(
-                            filters=shape[0],
-                            kernel_size=shape[2:],
-                            use_bias=False
-                        ))
-            
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=[None, 4, 64, 64], dtype=tf.float32, name='x'),
-            tf.TensorSpec(shape=[None], dtype=tf.int32, name='timestep'),
-            tf.TensorSpec(shape=[None, 77], dtype=tf.int32, name='input_ids'),
-            tf.TensorSpec(shape=[None, 77], dtype=tf.int32, name='attention_mask'),
-            tf.TensorSpec(shape=[None, 77], dtype=tf.int32, name='position_ids')
-        ])
-        def call(self, x, timestep, input_ids, attention_mask, position_ids):
-            # Forward pass implementation
-            # This is a placeholder - actual implementation will need to match OmniGen architecture
-            return x  # For now, just return input as placeholder
+    # Create model
+    model = TFOmniGen(state_dict)
     
-    # Create wrapper and save
-    tf_model = TFWrapper()
-    tf.saved_model.save(tf_model, output_path)
+    # Create input signature
+    input_signature = {
+        'x': tf.TensorSpec(shape=(None, 4, 64, 64), dtype=tf.float32, name='x'),
+        'timestep': tf.TensorSpec(shape=(None,), dtype=tf.int32, name='timestep'),
+        'input_ids': tf.TensorSpec(shape=(None, 77), dtype=tf.int32, name='input_ids'),
+        'attention_mask': tf.TensorSpec(shape=(None, 77), dtype=tf.int32, name='attention_mask'),
+        'position_ids': tf.TensorSpec(shape=(None, 77), dtype=tf.int32, name='position_ids')
+    }
+    
+    # Save the model
+    tf.saved_model.save(
+        model,
+        output_path,
+        signatures={'serving_default': model.call.get_concrete_function(input_signature)}
+    )
+    
     logger.info(f"Model converted and saved to {output_path}")
     return output_path
 
@@ -79,10 +117,13 @@ def download_and_convert(model_name="Shitao/omnigen-v1", output_dir="./"):
             # Try safetensors first
             weights_path = hf_hub_download(model_name, filename="model.safetensors")
             state_dict = load_file(weights_path)
-        except:
+            logger.info("Loaded weights from safetensors")
+        except Exception as e:
+            logger.warning(f"Failed to load safetensors: {e}")
             # Fall back to PyTorch weights
             weights_path = hf_hub_download(model_name, filename="pytorch_model.bin")
             state_dict = torch.load(weights_path)
+            logger.info("Loaded weights from PyTorch checkpoint")
         
         # Convert to TensorFlow
         tf_output_path = output_dir / "tf_model"
