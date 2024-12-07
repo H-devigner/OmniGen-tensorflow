@@ -48,81 +48,86 @@ class OmniGenPipeline:
         **kwargs
     ) -> "OmniGenPipeline":
         """Load pipeline from pretrained model."""
-        try:
-            # Download and set up processor
-            print("Loading processor...")
-            processor = OmniGenProcessor.from_pretrained(model_name)
-            
-            # Set up model with proper error handling
-            print("Loading model...")
-            model = OmniGenTF.from_pretrained(
-                model_name,
-                use_mixed_precision=mixed_precision,
-                **kwargs
-            )
-            
-            # Set up VAE
-            print("Loading VAE...")
-            if vae_path is None:
-                vae_path = model_name
-            vae = AutoencoderKL.from_pretrained(vae_path)
-            
-            # Initialize pipeline
-            return cls(
-                model=model,
-                processor=processor,
-                vae=vae,
-                **kwargs
-            )
-            
-        except Exception as e:
-            print(f"Error initializing pipeline: {str(e)}")
-            raise
-    
-    def __call__(
-        self,
-        prompt: str,
-        height: int = 512,
-        width: int = 512,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        negative_prompt: Optional[str] = None,
-        **kwargs
-    ) -> List[Image.Image]:
-        """Generate images from text prompt."""
-        try:
-            # Process input
-            print("Processing input...")
-            inputs = self.processor(
-                prompt,
-                height=height,
-                width=width,
-                negative_prompt=negative_prompt
-            )
-            
-            # Run inference with strategy
-            print("Generating image...")
-            with self.strategy.scope():
-                # Generate latents
-                latents = self.model.generate(
-                    **inputs,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
+        for attempt in range(max_retries):
+            try:
+                # Download model if needed
+                if not os.path.isdir(model_name):
+                    model_path = snapshot_download(
+                        model_name,
+                        allow_patterns=["*.safetensors", "*.json", "*.bin"]
+                    )
+                else:
+                    model_path = model_name
+                    
+                # Load model components
+                model = OmniGenTF.from_pretrained(
+                    model_path,
+                    use_mixed_precision=mixed_precision,
                     **kwargs
                 )
                 
-                # Decode latents
-                images = self.vae.decode(latents)
+                processor = OmniGenProcessor.from_pretrained(model_path)
                 
-            # Post-process
-            images = self.processor.postprocess_images(images)
+                # Load VAE
+                if vae_path is None:
+                    vae_path = model_path
+                vae = AutoencoderKL.from_pretrained(vae_path)
+                
+                return cls(
+                    model=model,
+                    processor=processor,
+                    vae=vae,
+                    device="gpu" if tf.config.list_physical_devices('GPU') else "cpu"
+                )
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                print(f"Attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                
+    def __call__(
+        self,
+        prompt: Union[str, List[str]],
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: int = 1,
+        **kwargs
+    ) -> List[Image.Image]:
+        """Generate images from text prompt."""
+        # Process inputs
+        inputs = self.processor(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            negative_prompt=negative_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            **kwargs
+        )
+        
+        # Generate images
+        with self.strategy.scope():
+            # Generate latents
+            latents = self.model(
+                inputs["input_ids"],
+                inputs["timesteps"],
+                attention_mask=inputs["attention_mask"],
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps
+            )
             
-            return images
+            # Scale latents
+            latents = latents * self.vae.scaling_factor
             
-        except Exception as e:
-            print(f"Error during generation: {str(e)}")
-            raise
-
-    def progress_bar(self, total):
-        """Get progress bar."""
-        return tqdm(total=total, desc="Generating image")
+            # Decode latents
+            images = self.vae.decode_from_latents(latents)
+            
+        # Post-process images
+        images = self.processor.postprocess_images(images)
+        
+        return images

@@ -13,6 +13,7 @@ from tensorflow.keras import layers, initializers
 import numpy as np
 import torch
 from safetensors import safe_open
+from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 
 # Local imports
@@ -372,54 +373,62 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
         **kwargs
     ) -> "OmniGenTF":
         """Load pretrained model."""
-        # Download model if needed
-        if not os.path.isdir(pretrained_model_path):
-            pretrained_model_path = snapshot_download(
-                pretrained_model_path,
-                allow_patterns=["*.safetensors", "*.json", "*.bin"]
-            )
+        try:
+            # Load configuration
+            config_path = os.path.join(pretrained_model_path, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+            else:
+                # Default config if not found
+                config = {
+                    "hidden_size": 768,
+                    "intermediate_size": 3072,
+                    "num_hidden_layers": 12,
+                    "num_attention_heads": 12,
+                    "max_position_embeddings": 2048,
+                    "layer_norm_eps": 1e-6,
+                    "hidden_dropout_prob": 0.1,
+                    "attention_probs_dropout_prob": 0.1
+                }
             
-        # Load config
-        config_file = os.path.join(pretrained_model_path, "config.json")
-        with open(config_file) as f:
-            config = json.load(f)
+            # Initialize model
+            model = cls(config, **kwargs)
             
-        # Update config with kwargs
-        config.update(kwargs)
-        
-        # Create model
-        model = cls(config)
-        
-        # Set mixed precision if requested
-        if use_mixed_precision:
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            tf.keras.mixed_precision.set_global_policy(policy)
+            # Set mixed precision if requested
+            if use_mixed_precision:
+                policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                tf.keras.mixed_precision.set_global_policy(policy)
             
-        # Load weights
-        weight_files = [f for f in os.listdir(pretrained_model_path) if f.endswith('.safetensors')]
-        if not weight_files:
-            raise ValueError(f"No safetensors weights found in {pretrained_model_path}")
-            
-        weight_file = os.path.join(pretrained_model_path, weight_files[0])
-        converter = WeightConverter()
-        
-        with safe_open(weight_file, framework="pt") as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
-                tf_tensor = converter.convert(tensor, key)
+            # Load weights
+            weight_files = [f for f in os.listdir(pretrained_model_path) if f.endswith('.safetensors')]
+            if not weight_files:
+                raise ValueError(f"No .safetensors files found in {pretrained_model_path}")
                 
-                # Find corresponding layer and weight
-                layer_name = key.split('.')[0]
-                layer = model.get_layer(layer_name)
+            # Initialize weight converter
+            converter = WeightConverter()
+            
+            # Load and convert weights
+            for weight_file in weight_files:
+                weight_path = os.path.join(pretrained_model_path, weight_file)
+                state_dict = load_file(weight_path)
                 
-                if isinstance(layer, tf.keras.layers.Layer):
-                    if key.endswith('.weight'):
-                        layer.kernel.assign(tf_tensor)
-                    elif key.endswith('.bias'):
-                        layer.bias.assign(tf_tensor)
-                        
-        return model
-
+                # Convert weights
+                tf_weights = converter.convert_torch_to_tf(state_dict)
+                
+                # Assign weights to model
+                for name, weight in zip(state_dict.keys(), tf_weights):
+                    tf_name = converter._convert_name(name)
+                    for var in model.trainable_variables:
+                        if var.name.split(':')[0].endswith(tf_name):
+                            var.assign(weight)
+                            break
+            
+            return model
+            
+        except Exception as e:
+            raise ValueError(f"Error loading pretrained model: {str(e)}")
+            
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
     """Generate 2D sinusoidal positional embeddings."""
     if isinstance(grid_size, int):
