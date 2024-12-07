@@ -421,6 +421,8 @@ class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
                 state_dict = load_file(weight_path)
                 
                 # Convert weights
+                print(f"State dict keys: {state_dict.keys()}")
+                print(f"State dict: {state_dict}")
                 tf_weights = converter.convert_torch_to_tf(state_dict)
                 
                 # Assign weights to model
