@@ -28,16 +28,19 @@ def modulate(x, shift, scale):
     """Modulate layer norm output."""
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
-class TimestepEmbedder(layers.Layer):
+class TimestepEmbedder(tf.keras.layers.Layer):
     """Embeds scalar timesteps into vector representations."""
+    
     def __init__(
         self,
         hidden_size,
         frequency_embedding_size=256,
         kernel_initializer=None,
-        bias_initializer=None
+        bias_initializer=None,
+        name=None,
+        **kwargs
     ):
-        super().__init__()
+        super().__init__(name=name, **kwargs)
         self.frequency_embedding_size = frequency_embedding_size
         
         # Initialize with proper initializers
@@ -47,7 +50,7 @@ class TimestepEmbedder(layers.Layer):
                 use_bias=True,
                 kernel_initializer=kernel_initializer,
                 bias_initializer=bias_initializer,
-                name='fc1'
+                name=f'{name}_fc1' if name else 'fc1'
             ),
             layers.Activation('swish'),
             layers.Dense(
@@ -55,46 +58,48 @@ class TimestepEmbedder(layers.Layer):
                 use_bias=True,
                 kernel_initializer=kernel_initializer,
                 bias_initializer=bias_initializer,
-                name='fc2'
+                name=f'{name}_fc2' if name else 'fc2'
             )
-        ])
+        ], name=f'{name}_mlp' if name else 'mlp')
         
     def call(self, t: tf.Tensor) -> tf.Tensor:
         """Forward pass."""
         # Create sinusoidal embeddings
         half_dim = self.frequency_embedding_size // 2
-        freqs = tf.math.exp(
-            -math.log(10000.0) * tf.range(0, half_dim, dtype=tf.float32) / half_dim
-        )
-        args = tf.cast(t, tf.float32)[:, None] * freqs[None]
-        embedding = tf.concat([tf.math.cos(args), tf.math.sin(args)], axis=-1)
+        emb = tf.math.log(10000.0) / (half_dim - 1)
+        emb = tf.exp(tf.range(half_dim, dtype=tf.float32) * -emb)
+        emb = tf.cast(t, dtype=tf.float32)[:, None] * emb[None, :]
+        emb = tf.concat([tf.sin(emb), tf.cos(emb)], axis=1)
         
-        # Project to hidden size
-        return self.mlp(embedding)
+        # Map to hidden_size
+        return self.mlp(emb)
 
-class FinalLayer(layers.Layer):
+class FinalLayer(tf.keras.layers.Layer):
     """The final layer of OmniGen."""
+    
     def __init__(
         self,
         hidden_size,
         patch_size,
         out_channels,
         kernel_initializer=None,
-        bias_initializer=None
+        bias_initializer=None,
+        name=None,
+        **kwargs
     ):
-        super().__init__()
+        super().__init__(name=name, **kwargs)
         self.norm_final = layers.LayerNormalization(
             epsilon=1e-6,
             center=False,
             scale=False,
-            name='norm_final'
+            name=f'{name}_norm_final' if name else 'norm_final'
         )
         self.linear = layers.Dense(
             patch_size * patch_size * out_channels,
             use_bias=True,
             kernel_initializer=kernel_initializer,
             bias_initializer=bias_initializer,
-            name='linear'
+            name=f'{name}_linear' if name else 'linear'
         )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('swish'),
@@ -103,19 +108,20 @@ class FinalLayer(layers.Layer):
                 use_bias=True,
                 kernel_initializer=kernel_initializer,
                 bias_initializer=bias_initializer,
-                name='adaLN_modulation'
+                name=f'{name}_adaLN_modulation' if name else 'adaLN_modulation'
             )
-        ])
+        ], name=f'{name}_adaLN_seq' if name else 'adaLN_seq')
         
     def call(self, x: tf.Tensor, c: tf.Tensor) -> tf.Tensor:
         """Forward pass."""
-        shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=-1)
+        shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
-class PatchEmbedMR(layers.Layer):
+class PatchEmbedMR(tf.keras.layers.Layer):
     """2D Image to Patch Embedding."""
+    
     def __init__(
         self,
         patch_size=2,
@@ -123,9 +129,11 @@ class PatchEmbedMR(layers.Layer):
         embed_dim=768,
         bias=True,
         kernel_initializer=None,
-        bias_initializer=None
+        bias_initializer=None,
+        name=None,
+        **kwargs
     ):
-        super().__init__()
+        super().__init__(name=name, **kwargs)
         self.proj = layers.Conv2D(
             filters=embed_dim,
             kernel_size=patch_size,
@@ -134,15 +142,13 @@ class PatchEmbedMR(layers.Layer):
             kernel_initializer=kernel_initializer,
             bias_initializer=bias_initializer,
             data_format='channels_last',
-            name='proj'
+            name=f'{name}_proj' if name else 'proj'
         )
         
     def call(self, x: tf.Tensor) -> tf.Tensor:
         """Forward pass."""
-        B, H, W, C = tf.shape(x)
-        x = self.proj(x)
-        Hp, Wp = tf.shape(x)[1], tf.shape(x)[2]
-        x = tf.reshape(x, [B, Hp * Wp, -1])
+        B, H, W, C = x.shape
+        x = self.proj(x)  # B, H//2, W//2, embed_dim
         return x
 
 class OmniGenTF(tf.keras.Model, PeftAdapterMixin):
