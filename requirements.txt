@@ -5,3 +5,4 @@ huggingface_hub
 numpy
 tqdm
 transformers
+diffusers
