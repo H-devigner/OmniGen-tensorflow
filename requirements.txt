@@ -1,0 +1,7 @@
+tensorflow
+torch
+safetensors
+huggingface_hub
+numpy
+tqdm
+transformers
